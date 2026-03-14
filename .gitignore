@@ -1,0 +1,26 @@
+# ROS 2 Workspace Directories
+build/
+install/
+log/
+src_learn
+Past_code/
+quick_start_lattice.sh
+test_lattice_planner.sh
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE configurations
+.vscode/
+compile_commands.json
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
