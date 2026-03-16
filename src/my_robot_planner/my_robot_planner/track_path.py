@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped, Twist
+from geometry_msgs.msg import PoseStamped, Twist, PointStamped
 from nav_msgs.msg import Path
 import math
 
@@ -12,7 +12,7 @@ class TrackPath(Node):
         self.path_sub = self.create_subscription(Path, '/path', self.path_callback, 10)
         
         self.sub_mocap = self.create_subscription(PoseStamped, '/vrpn_mocap/rm_0_Test/pose', self.pose_callback, 10)
-        self.sub_gps = self.create_subscription(PoseStamped, '/agent0/gps', self.pose_callback, 10)
+        self.sub_gps = self.create_subscription(PointStamped, '/agent0/gps', self.gps_callback, 10)
         
         self.cmd_pub1 = self.create_publisher(Twist, '/cmd_vel', 10)
         self.cmd_pub2 = self.create_publisher(Twist, '/agent0/cmd_vel', 10)
@@ -30,6 +30,13 @@ class TrackPath(Node):
 
     def pose_callback(self, msg):
         self.current_pose = msg
+
+    def gps_callback(self, msg):
+        pose_msg = PoseStamped()
+        pose_msg.header = msg.header
+        pose_msg.pose.position = msg.point
+        pose_msg.pose.orientation.w = 1.0
+        self.current_pose = pose_msg
 
     def control_loop(self):
         if self.desired_path is None or self.current_pose is None:

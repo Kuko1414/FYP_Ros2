@@ -1,6 +1,6 @@
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, PointStamped
 from nav_msgs.msg import Path
 import math
 import threading
@@ -13,7 +13,7 @@ class GeneratePath(Node):
         self.path_pub = self.create_publisher(Path, '/path', 10)
         
         self.sub_mocap = self.create_subscription(PoseStamped, '/vrpn_mocap/rm_0_Test/pose', self.pose_callback, 10)
-        self.sub_gps = self.create_subscription(PoseStamped, '/agent0/gps', self.pose_callback, 10)
+        self.sub_gps = self.create_subscription(PointStamped, '/agent0/gps', self.gps_callback, 10)
         
         self.start_pose = None
         self.got_start = False
@@ -27,6 +27,17 @@ class GeneratePath(Node):
             self.start_pose = msg
             self.got_start = True
             self.get_logger().info("Received start configuration.")
+
+    def gps_callback(self, msg):
+        if not self.got_start:
+            pose_msg = PoseStamped()
+            pose_msg.header = msg.header
+            pose_msg.pose.position = msg.point
+            pose_msg.pose.orientation.w = 1.0
+            
+            self.start_pose = pose_msg
+            self.got_start = True
+            self.get_logger().info("Received start configuration from GPS.")
 
     def wait_for_input(self):
         while rclpy.ok():
