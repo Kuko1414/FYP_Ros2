@@ -1,0 +1,8 @@
+# Request: target coordinates and path shape
+float64 target_x
+float64 target_y
+string shape
+---
+# Response: generated path
+nav_msgs/Path path
+bool success
