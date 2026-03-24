@@ -9,7 +9,7 @@ os.environ["http_proxy"] = "http://127.0.0.1:7897"
 os.environ["https_proxy"] = "http://127.0.0.1:7897"
 
 # 1. 初始化客户端 (优先从环境变量读取 API Key)
-api_key = os.environ.get("GEMINI_API_KEY", "AIzaSyAuPM44rePSn5vf9zQkSZMetKv6ihJyuwU")
+api_key = os.environ.get("GEMINI_API_KEY", "INPUT_YOUR_API_KEY")
 client = genai.Client(api_key=api_key)
 
 
