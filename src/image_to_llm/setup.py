@@ -1,6 +1,6 @@
 from setuptools import find_packages, setup
 
-package_name = 'my_robot_planner'
+package_name = 'image_to_llm'
 
 setup(
     name=package_name,
@@ -24,9 +24,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'generate_path = my_robot_planner.generate_path:main',
-            'track_path = my_robot_planner.track_path:main',
-            'image_conversion = my_robot_planner.image_conversion:main',
+            'image_to_llm_node = image_to_llm.image_to_llm_node:main',
         ],
     },
 )

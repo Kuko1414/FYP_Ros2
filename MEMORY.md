@@ -19,3 +19,9 @@ For AI coding agents. This is a record of each change made to the workspace cont
 - 更新了 `test_sendImage.py` prompt，向 Gemini 注入图像实际宽高 (`img.size`)，并强调使用左上角为 `(0,0)`、范围在 `[0, width]` 及 `[0, height]` 内的坐标系。原因在于提升轨迹坐标提取与红线绘制的准确度，此举验证了基于大模型视觉感知的精准空间映射映射能力，契合系统端到端智能路径规划的设计要求。
 - 修改了 `test_sendImage.py`，更改提示词要求模型输出 `[0, 1000]` 的归一化坐标，并在代码中根据原图宽高进行缩放还原。原因：直接请求绝对像素坐标会产生严重的平移偏移。设计对齐：此举大幅提升了大模型输出空间坐标的准确性，确保规划路径与图像精确对齐，符合系统高精度视觉引导的要求。
 
+
+## Mar.28, 2026
+- 将 Gemini 多模态视觉模型接入 ROS2 节点流，完成了 Step 4 的核心图像转换开发。为了保证系统解耦与高并发稳定性，将其抽取为了两个独立环节：
+  1. 新建 `image_to_llm` 包与 `image_to_llm_node` 节点，专门负责订阅彩色摄像头的 `sensor_msgs/Image`，通过内部封装将实时帧发送给 Gemini 2.5 Flash 多模态 API 并取回 2D 像素坐标系下避障路点的 JSON 然后发布于 `/llm_pixels`。
+  2. 在 `my_robot_planner` 中新增了 `image_conversion` 节点。它监听 LLM 返回的像素坐标 JSON，结合深度相机 `depth_image` 提取的 `mono16` 毫米深度，利用相机内参模型 ($K$ 矩阵 $f_x, f_y, c_x, c_y$) 精准还原生成带方向的 $3D$ 真实坐标数据，并包装在 `nav_msgs/Path`。
+- 修改了 `ARCHITECTURE.md` 与实际开发代码相匹配，增加了基于触发服务 `std_srvs/srv/Trigger` 的执行逻辑设计，以避免由于轮询刷新率过高导致的 API 并发上限与财务损失风险。

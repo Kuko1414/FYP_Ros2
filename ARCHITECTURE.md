@@ -24,13 +24,13 @@ The topic for depth camera and vision (Added for Step 3 & Step 4):
 
 ## 3. ROS2 Nodes
 
-- 'Generate_Path': This node is responsible for generating path points based on the starting point, ending point, and the desired path shape. It will publish the generated path points to the '/path' topic. (Optimization: To prevent blocking the ROS2 executor, user inputs for coordinates and shapes should be handled via a non-blocking separate thread, or ideally designed as a ROS2 Service/Action).
+- 'Generate_Path': （Not use）This node is responsible for generating path points based on the starting point, ending point, and the desired path shape. It will publish the generated path points to the '/path' topic. (Optimization: To prevent blocking the ROS2 executor, user inputs for coordinates and shapes should be handled via a non-blocking separate thread, or ideally designed as a ROS2 Service/Action).
 
 - 'Track_Path': This node receives the path points from the '/path' topic. It stores it as the desired path, calculates the deviation from the ideal path points continuously, and applies a feedback control algorithm (e.g., Pure Pursuit or continuous PID) to publish speed commands. If deviation is dangerously large (>0.5m), it stops the vehicle and requests a replan.
 
 - 'Image_Conversion': This node converts pixel-coordinates from the LLM (Gemini) into actual path points in meters. (Optimization: It MUST subscribe to the pixel coordinates AND the depth camera topics ('depth_image' and 'camera_info') to perform accurate 2D to 3D inverse projection mapping), then it publishes the converted path points to the '/path' topic.
 
-- 'rgb_image': This node is responsible for capturing RGB images from the depth camera. (blind for now)
+- 'image_to_llm': This node is send and response for the Gemini API. It sends the RGB image captured from the front camera to Gemini and receives the path points in normalized coordinates. It then publishes these pixel coordinates to a topic ('/llm_pixels') for the 'Image_Conversion' node to process.
 
 - 'depth_image': This node is responsible for capturing depth images from the depth camera. (blind for now)
 
