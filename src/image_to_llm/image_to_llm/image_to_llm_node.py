@@ -23,7 +23,7 @@ class ImageToLLMNode(Node):
         self.bridge = CvBridge()
         
         # 声明参数
-        self.declare_parameter('rgb_topic', '/camera/color/image_raw') 
+        self.declare_parameter('rgb_topic', '/depth_cam/rgb0/image_raw') 
         self.declare_parameter('pixel_path_topic', '/llm_pixels')
         self.declare_parameter('env_path', 'src/image_to_llm/llm_config.env')
         
