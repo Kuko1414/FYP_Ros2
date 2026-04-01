@@ -26,7 +26,6 @@ setup(
         'console_scripts': [
             'generate_path = my_robot_planner.generate_path:main',
             'track_path = my_robot_planner.track_path:main',
-            'image_conversion = my_robot_planner.image_conversion:main',
         ],
     },
 )

@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'image_to_llm_node = image_to_llm.image_to_llm_node:main',
+            'image_conversion = image_to_llm.image_conversion:main',
         ],
     },
 )

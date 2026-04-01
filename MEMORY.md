@@ -25,3 +25,22 @@ For AI coding agents. This is a record of each change made to the workspace cont
   1. 新建 `image_to_llm` 包与 `image_to_llm_node` 节点，专门负责订阅彩色摄像头的 `sensor_msgs/Image`，通过内部封装将实时帧发送给 Gemini 2.5 Flash 多模态 API 并取回 2D 像素坐标系下避障路点的 JSON 然后发布于 `/llm_pixels`。
   2. 在 `my_robot_planner` 中新增了 `image_conversion` 节点。它监听 LLM 返回的像素坐标 JSON，结合深度相机 `depth_image` 提取的 `mono16` 毫米深度，利用相机内参模型 ($K$ 矩阵 $f_x, f_y, c_x, c_y$) 精准还原生成带方向的 $3D$ 真实坐标数据，并包装在 `nav_msgs/Path`。
 - 修改了 `ARCHITECTURE.md` 与实际开发代码相匹配，增加了基于触发服务 `std_srvs/srv/Trigger` 的执行逻辑设计，以避免由于轮询刷新率过高导致的 API 并发上限与财务损失风险。
+
+## Apr.1, 2026
+- 将 `image_conversion` 节点从 `my_robot_planner` 包迁移至 `image_to_llm` 包，使 LLM 图像处理链路（发送+转换）在同一包内，提升模块内聚性。同步更新了两个包的 `setup.py` 入口点和 `image_to_llm/package.xml` 依赖（新增 `nav_msgs`、`geometry_msgs`）。
+- 修复 `image_to_llm_node`：使用 `MultiThreadedExecutor` + `MutuallyExclusiveCallbackGroup` 解决 Gemini API 同步调用阻塞 `rgb_callback` 的问题；将 `json.loads()` 验证移至 `publish()` 之前，防止发布无效 JSON。
+- 优化 `image_conversion`：将单点深度采样改为 5×5 窗口中值采样（`np.median`），提升抗噪声和深度空洞的鲁棒性。删除冗余导入。
+- 更新 `ARCHITECTURE.md`：新增 `/imu/rpy/filtered`、`/odom`、`/tf`、`/tf_static`、`/depth_cam/rgb0/camera_info`、`/depth_cam/depth0/points` 等高价值 topic 文档，为 Step 5/6 开发提供参考。
+- 在 `PROCESS.md` 中新增 Section 3（Extension Steps）和 Section 4（Deployment Notes），规划了核心管线之后的扩展路线，面向 Jetson Orin Nano 部署：
+  - **Step 7**（高优先级）：实时可通行区域语义分割。新建 `semantic_perception` 包，用 BiSeNetV2/MobileNetV3-Seg（TensorRT FP16, ~10ms）对 RGB 逐像素分类，发布 `/semantic_mask`、`/traversable_path`（本地 fallback 路径）、`/semantic_overlay`。将架构从"停车等 API"改为"并行预判+本地 fallback"，消除 Gemini 延迟导致的停车等待。
+  - **Step 8**（中优先级）：深度补全 CNN。在 `image_conversion` 节点内集成小型 U-Net（TensorRT FP16, ~5-10ms），输入 RGB+原始深度，输出修复后稠密深度图，提升 3D 坐标精度，消除深度空洞和边缘飞点。
+  - **Step 9**（低优先级，依赖 Step 6+7）：持久语义地图。新增 `semantic_map_node`，将逐帧语义分割结果通过 TF2 累积为全局 `OccupancyGrid`，实现跨视野障碍记忆与全局路径规划。
+  - **Step 10**：全系统集成优化，包括统一 launch 文件、GPU 显存管理、延迟 profiling、故障处理和 QoS 调优。
+
+## Apr.1, 2026 (续)
+- 在 `track_path.py` 中实现了 LLM 自动触发闭环（Step 5 核心），完成三种触发时机：
+  1. **启动触发**：节点启动 3 秒后自动调用 `/trigger_llm_plan` 服务请求首条路径（一次性定时器 `startup_timer`）。
+  2. **路径完成触发**：`control_loop` 检测到到达终点（<0.15m）后自动调用 `trigger_llm_replan("path_completed")`。
+  3. **障碍物触发**：新增 `depth_obstacle_callback` 订阅深度图 `/depth_cam/depth0/image_raw`，检查中央 1/3 ROI 最近深度 < 0.8m 时停车并触发 LLM。含 10 秒冷却期防重复触发。
+- 新增 `Trigger` 服务客户端连接 `image_to_llm_node` 的 `/trigger_llm_plan`，使用 `MutuallyExclusiveCallbackGroup` + `MultiThreadedExecutor` 确保异步调用不阻塞 10Hz 控制循环。
+- 更新 `my_robot_planner/package.xml` 新增 `tf2_ros` 依赖。至此端到端闭环打通：`track_path 触发 → Gemini API → /llm_pixels → image_conversion → /path → track_path 跟踪 → 再次触发`。尚未在实机验证。

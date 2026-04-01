@@ -15,12 +15,28 @@ The topic for sending the speed to the robot:
     - 'Twist, /agent0/cmd_vel' (include: linear x,y,z and angular x,y,z)
     - 'Twist, /cmd_vel' (include: linear x,y,z and angular x,y,z)
     
+The topic for obtaining the robot's orientation (yaw):
+    - 'Vector3Stamped, /imu/rpy/filtered' (include: header with frame_id 'imu_link', vector.x=Roll, vector.y=Pitch, vector.z=Yaw, all in radians. This is the filtered RPY output, vector.z can be used directly as the robot's heading angle)
+
 The topic for sending the path points to the robot:
     - 'Path, /path' (include: header and poses)
 
 The topic for depth camera and vision (Added for Step 3 & Step 4):
-    - 'Image, /camera/depth/image_raw' (depth_image topic)
-    - 'CameraInfo, /camera/depth/camera_info' (camera_info for pixel to physical conversion)
+    - 'Image, /depth_cam/rgb0/image_raw' (RGB image from depth camera)
+    - 'CameraInfo, /depth_cam/depth0/camera_info' (camera_info for pixel to physical conversion)
+    - 'Image, /depth_cam/depth0/image_raw' (the depth image data for obstacle detection and path planning)
+    - 'CameraInfo, /depth_cam/rgb0/camera_info' (RGB camera intrinsic parameters. image_conversion node should subscribe to this to dynamically obtain fx, fy, cx, cy instead of hardcoding)
+    - 'PointCloud2, /depth_cam/depth0/points' (3D point cloud from depth camera. Can be used for obstacle detection and spatial reasoning, more powerful than per-pixel depth lookup)
+    - 'Image, /depth_cam/ir0/image_raw' (infrared image from depth camera)
+
+The topic for odometry and coordinate transforms (needed for Step 6 TF2):
+    - 'Odometry, /odom' (include: pose with position+orientation, twist with linear+angular velocity. Core data source for odom frame, can also serve as position feedback for Track_Path)
+    - 'TFMessage, /tf' (dynamic coordinate transform tree, essential for Step 6 depth_camera_link → odom/map transform)
+    - 'TFMessage, /tf_static' (static coordinate transforms, e.g. camera mount position relative to base_link)
+
+The topic for getting pose of the robot from imu:
+    - 'Imu, /agent0/imu' (its imu for webots robot, include: orientation, angular velocity, linear acceleration)
+    - 'Imu, /imu' (real robot raw IMU data)
 
 ## 3. ROS2 Nodes
 

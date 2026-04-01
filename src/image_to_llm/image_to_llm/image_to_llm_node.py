@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import Image
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
@@ -55,14 +57,18 @@ class ImageToLLMNode(Node):
         # 初始化 Gemini
         self.client = genai.Client(api_key=self.api_key)
         
+        # 回调组：将 service 放入独立的回调组，避免阻塞 rgb_callback
+        self._srv_cb_group = MutuallyExclusiveCallbackGroup()
+        
         # 订阅彩色图片
         self.sub_rgb = self.create_subscription(Image, rgb_topic, self.rgb_callback, 10)
         
         # 发布 2D 像素 JSON
         self.pixel_pub = self.create_publisher(String, pixel_path_topic, 10)
         
-        # 触发服务
-        self.srv = self.create_service(Trigger, 'trigger_llm_plan', self.plan_callback)
+        # 触发服务（放入独立回调组，配合 MultiThreadedExecutor 使用）
+        self.srv = self.create_service(Trigger, 'trigger_llm_plan', self.plan_callback,
+                                       callback_group=self._srv_cb_group)
         
         self.latest_rgb = None
         
@@ -115,12 +121,13 @@ class ImageToLLMNode(Node):
             if json_match:
                 json_str = json_match.group(0)
             
-            # 发布纯 JSON 字符串
+            # 先验证 JSON 合法性，再发布
+            parsed = json.loads(json_str)
+            
             msg = String()
             msg.data = json_str
             self.pixel_pub.publish(msg)
             
-            parsed = json.loads(json_str)
             self.get_logger().info(f"Gemini 返回成功，已发布包含 {len(parsed)} 个像素点的 JSON。")
             response.success = True
             response.message = f"成功获取 {len(parsed)} 个点"
@@ -135,9 +142,14 @@ class ImageToLLMNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = ImageToLLMNode()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    # 使用多线程执行器，使 service 回调（Gemini API 调用）不阻塞 rgb_callback
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

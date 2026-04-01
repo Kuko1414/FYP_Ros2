@@ -1,9 +1,14 @@
 import rclpy
 from rclpy.node import Node
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import PoseStamped, Twist, PointStamped
-from sensor_msgs.msg import Imu
-from nav_msgs.msg import Path
+from sensor_msgs.msg import Image
+from nav_msgs.msg import Path, Odometry
+from std_srvs.srv import Trigger
 from my_robot_msgs.srv import GeneratePath as GeneratePathSrv
+from cv_bridge import CvBridge
+import numpy as np
 import math
 import time
 
@@ -51,19 +56,43 @@ class TrackPath(Node):
         super().__init__('track_path')
         self.get_logger().info("Track Path node started")
         
+        self.bridge = CvBridge()
+        
+        # 回调组：将 LLM 服务调用放入独立回调组，避免阻塞控制循环
+        self._llm_cb_group = MutuallyExclusiveCallbackGroup()
+        
         self.path_sub = self.create_subscription(Path, '/path', self.path_callback, 10)
         
         self.sub_mocap = self.create_subscription(PoseStamped, '/vrpn_mocap/rm_0_Test/pose', self.pose_callback, 10)
         self.sub_gps = self.create_subscription(PointStamped, '/agent0/gps', self.gps_callback, 10)
         
-        # Subscribe to IMU for orientation (yaw)
-        self.sub_imu = self.create_subscription(Imu, '/agent0/imu', self.imu_callback, 10)
+        # Subscribe to /odom for position + yaw (real robot primary source)
+        self.sub_odom = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+        
+        # 订阅深度图用于障碍物检测
+        self.declare_parameter('depth_topic', '/depth_cam/depth0/image_raw')
+        self.declare_parameter('obstacle_distance', 0.8)   # 障碍物检测距离（米）
+        self.declare_parameter('obstacle_check_enabled', True)
+        
+        depth_topic = self.get_parameter('depth_topic').value
+        self.obstacle_distance = self.get_parameter('obstacle_distance').value
+        self.obstacle_check_enabled = self.get_parameter('obstacle_check_enabled').value
+        
+        self.sub_depth = self.create_subscription(Image, depth_topic, self.depth_obstacle_callback, 10)
+        self.obstacle_detected = False
+        self.obstacle_cooldown_until = 0.0  # 防止重复触发的冷却时间戳
         
         self.cmd_pub1 = self.create_publisher(Twist, '/cmd_vel', 10)
         self.cmd_pub2 = self.create_publisher(Twist, '/agent0/cmd_vel', 10)
         
         # Service client for replan requests to Generate_Path
         self.replan_client = self.create_client(GeneratePathSrv, '/generate_path')
+        
+        # LLM 触发服务客户端（异步调用 image_to_llm_node 的 /trigger_llm_plan）
+        self.llm_trigger_client = self.create_client(
+            Trigger, '/trigger_llm_plan',
+            callback_group=self._llm_cb_group)
+        self.llm_request_in_progress = False
         
         self.desired_path = None
         self.current_target_idx = 0
@@ -101,12 +130,116 @@ class TrackPath(Node):
         self.path_completed = False
         
         self.timer = self.create_timer(0.1, self.control_loop)  # 10Hz
+        
+        # 启动时自动触发 LLM 请求首条路径（延迟 3 秒等待各节点就绪）
+        self.startup_timer = self.create_timer(3.0, self.startup_trigger_llm,
+                                                callback_group=self._llm_cb_group)
+        self.get_logger().info("将在 3 秒后自动向 LLM 请求首条路径...")
+
+    # ==================== LLM 触发相关方法 ====================
+    
+    def startup_trigger_llm(self):
+        """启动时自动触发一次 LLM 请求首条路径，然后取消此定时器。"""
+        self.startup_timer.cancel()
+        self.get_logger().info("启动阶段：自动向 LLM 请求首条路径...")
+        self.trigger_llm_replan("startup")
+    
+    def trigger_llm_replan(self, reason="unknown"):
+        """异步调用 /trigger_llm_plan 服务，请求 LLM 规划新路径。
+        
+        Args:
+            reason: 触发原因，用于日志记录（startup / path_completed / obstacle）
+        """
+        if self.llm_request_in_progress:
+            self.get_logger().info(f"LLM 请求已在进行中，跳过重复触发（原因: {reason}）")
+            return
+        
+        if not self.llm_trigger_client.service_is_ready():
+            self.get_logger().warn(
+                f"/trigger_llm_plan 服务不可用（原因: {reason}）。"
+                "请确保 image_to_llm_node 已启动。")
+            return
+        
+        self.llm_request_in_progress = True
+        self.stop_robot()
+        self.get_logger().info(f">>> 向 LLM 请求路径规划（原因: {reason}）")
+        
+        request = Trigger.Request()
+        future = self.llm_trigger_client.call_async(request)
+        future.add_done_callback(self.llm_response_callback)
+    
+    def llm_response_callback(self, future):
+        """处理 LLM 服务响应。路径将通过 /path topic 由 image_conversion 发布。"""
+        self.llm_request_in_progress = False
+        try:
+            response = future.result()
+            if response.success:
+                self.get_logger().info(f"LLM 响应成功: {response.message}")
+                # 路径会通过 /path topic 回来，path_callback 会自动处理
+            else:
+                self.get_logger().error(f"LLM 响应失败: {response.message}")
+        except Exception as e:
+            self.get_logger().error(f"LLM 服务调用异常: {e}")
+    
+    # ==================== 深度图障碍物检测 ====================
+    
+    def depth_obstacle_callback(self, msg):
+        """从深度图检测正前方障碍物。检查图像中央区域的最近深度值。"""
+        if not self.obstacle_check_enabled:
+            return
+        
+        # 没有路径在执行时不检测（避免启动阶段误触发）
+        if self.desired_path is None or self.path_completed:
+            return
+        
+        # 已经在处理障碍物或 LLM 请求中，不重复检测
+        if self.llm_request_in_progress or self.obstacle_detected:
+            return
+        
+        # 冷却期内不检测（防止 LLM 返回新路径后立即再次触发）
+        if time.monotonic() < self.obstacle_cooldown_until:
+            return
+        
+        try:
+            depth_img = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
+        except Exception as e:
+            self.get_logger().error(f"深度图转换错误: {e}")
+            return
+        
+        h, w = depth_img.shape[:2]
+        
+        # 取图像中央 1/3 区域（小车正前方视野）
+        roi = depth_img[h // 3 : 2 * h // 3, w // 3 : 2 * w // 3]
+        
+        # 提取有效深度值（排除 0 和 NaN）
+        valid_depths = roi.flatten()
+        valid_depths = valid_depths[valid_depths > 0]
+        
+        if len(valid_depths) == 0:
+            return
+        
+        min_depth_m = float(np.min(valid_depths)) / 1000.0  # mm → m
+        
+        if min_depth_m < self.obstacle_distance:
+            self.obstacle_detected = True
+            self.stop_robot()
+            self.get_logger().warn(
+                f"⚠️ 检测到障碍物！最近距离: {min_depth_m:.2f}m < 阈值 {self.obstacle_distance:.2f}m。"
+                "停车并向 LLM 请求避障路径...")
+            self.trigger_llm_replan("obstacle")
+
+    # ==================== 路径与位置回调 ====================
 
     def path_callback(self, msg):
         self.desired_path = msg.poses
         self.current_target_idx = 0
         self.replan_in_progress = False
         self.path_completed = False
+        
+        # 收到新路径后重置障碍物状态，并设置 10 秒冷却期
+        self.obstacle_detected = False
+        self.llm_request_in_progress = False
+        self.obstacle_cooldown_until = time.monotonic() + 10.0
         
         # Reset PID controllers for new path
         self.angular_pid.reset()
@@ -129,19 +262,25 @@ class TrackPath(Node):
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
 
+    def odom_callback(self, msg):
+        """从 /odom 获取位置和朝向（真实机器人主要位置源）。
+        Odometry 同时包含 position 和 orientation，可一次性更新 pose 和 yaw。"""
+        pose_msg = PoseStamped()
+        pose_msg.header = msg.header
+        pose_msg.pose = msg.pose.pose
+        self.current_pose = pose_msg
+        # 从 odom orientation 提取 yaw
+        q = msg.pose.pose.orientation
+        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
+        self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
+
     def gps_callback(self, msg):
         pose_msg = PoseStamped()
         pose_msg.header = msg.header
         pose_msg.pose.position = msg.point
         pose_msg.pose.orientation.w = 1.0
         self.current_pose = pose_msg
-
-    def imu_callback(self, msg):
-        """Extract yaw from IMU orientation quaternion."""
-        q = msg.orientation
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
 
     def compute_cross_track_error(self):
         """Compute the perpendicular (cross-track) distance from current position to the nearest path segment.
@@ -291,6 +430,8 @@ class TrackPath(Node):
             self.path_completed = True
             self.get_logger().info(f"Path tracking completed! Final distance: {dist_to_final:.3f}m")
             self.desired_path = None
+            # 路径走完后自动向 LLM 请求下一段路径
+            self.trigger_llm_replan("path_completed")
             return
         
         # Compute cross-track error (perpendicular distance to path)
@@ -345,9 +486,14 @@ class TrackPath(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = TrackPath()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    # 使用多线程执行器，使 LLM 服务回调不阻塞控制循环和传感器回调
+    executor = MultiThreadedExecutor()
+    executor.add_node(node)
+    try:
+        executor.spin()
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
