@@ -44,3 +44,38 @@ For AI coding agents. This is a record of each change made to the workspace cont
   3. **障碍物触发**：新增 `depth_obstacle_callback` 订阅深度图 `/depth_cam/depth0/image_raw`，检查中央 1/3 ROI 最近深度 < 0.8m 时停车并触发 LLM。含 10 秒冷却期防重复触发。
 - 新增 `Trigger` 服务客户端连接 `image_to_llm_node` 的 `/trigger_llm_plan`，使用 `MutuallyExclusiveCallbackGroup` + `MultiThreadedExecutor` 确保异步调用不阻塞 10Hz 控制循环。
 - 更新 `my_robot_planner/package.xml` 新增 `tf2_ros` 依赖。至此端到端闭环打通：`track_path 触发 → Gemini API → /llm_pixels → image_conversion → /path → track_path 跟踪 → 再次触发`。尚未在实机验证。
+
+## Apr.8, 2026
+- 为 `image_conversion` 添加智能就绪等待：camera_info + 深度图未就绪时缓存 `/llm_pixels` 消息（`_pending_pixel_msg`），两者就绪后自动处理缓存，消除启动顺序依赖。
+- 重构 `track_path` 启动触发逻辑：将固定 3 秒定时器改为每 2 秒轮询 `/trigger_llm_plan` 服务可用性，确认可用后才触发首次 LLM 请求，彻底消除启动时序竞态。
+- 新建 `my_robot_planner/launch/robot_vlm_launch.py` 一键启动 3 个核心节点（image_to_llm_node + image_conversion + track_path），更新 `setup.py` 注册 launch 文件。
+- 同步更新 `README.md`：新增一键 Launch 启动说明、节点就绪逻辑表格、目录结构中 launch 文件。
+
+- 同步更新 `README.md`：新增一键 Launch 启动说明、节点就绪逻辑表格、目录结构中 launch 文件。
+=======
+- 同步更新 `README.md`：新增一键 Launch 启动说明、节点就绪逻辑表格、目录结构中 launch 文件。
+
+## Apr.8, 2026 (续)
+- 重写 `image_conversion` 节点，改用 **PointCloud2 点云优先**的三级 fallback 架构：Level 1 从 `/depth_cam/depth0/points` 按像素索引直接获取 3D 坐标（无需针孔模型反投影）；Level 2 fallback 到深度图+内参；Level 3 fallback 到地面平面假设。原因：实测深度图因地面材质全零，但点云有 12476 个有效 3D 点（100% 有效率）。
+- 修复 TF2 逐点变换失败导致路径点被丢弃的问题：异常捕获后降级为 `depth_camera_link` 坐标系发布，而非静默丢弃。将逐点变换时间戳改为 `rclpy.time.Time()`（最新可用变换），解决 `ExtrapolationException`。
+- 点云订阅使用 `BEST_EFFORT` QoS 匹配发布端。更新 `robot_vlm_launch.py` 新增 `pointcloud_topic`、`pc_search_radius` 参数。小车跟踪效果仍待进一步调试（坐标系变换后路径点在 odom 平面的分布可能需要优化）。
+
+## Apr.10, 2026
+- 重构 `track_path.py`：因路径点改由 Gemini 经 `image_conversion` 提供，移除所有 `generate_path` 服务客户端、LLM 自动触发逻辑、深度图障碍物检测。简化为单线程 `rclpy.spin()` 的纯 PID 路径点追踪器。同步更新 `package.xml`（移除 `cv_bridge`、`std_srvs`、`tf2_ros`）。
+- 诊断深度相机问题：深度图 89.9% 零值（地面 98.8% 零值），原因是相机安装太低（~11cm）导致入射角过大+地面镜面反射。深度值本身正确（`mono16` mm 单位）。将诊断结论写入 `PROCESS.md` 警告章节。
+- 将 `track_path.py` 障碍物检测从点云改为**雷达 LaserScan**（`/scan_raw`）。雷达 91.3% 有效率、0.06m~25m 量程、360° 覆盖，远优于深度相机（1.3m 盲区）。点云保留给 `image_conversion` 做像素→3D 坐标转换。更新 `robot_vlm_launch.py` 参数和 `ARCHITECTURE.md` 新增雷达话题文档。
+
+## Apr.13, 2026
+- 更换深度相机为奥比中光 Gemini 2L（双目），全面移除雷达依赖，改用深度图做距离计算和障碍物检测。
+- 重写 `image_conversion.py`：移除雷达+固定步长模式，改用**针孔相机模型反投影**（`Z=depth[v,u]`, `X=(u-cx)*Z/fx`, `Y=(v-cy)*Z/fy`）+ odom 坐标转换。新增深度图订阅（BEST_EFFORT QoS）、窗口中值滤波采样、地面平面 fallback。所有话题参数化。
+- 精简 `track_path.py`（722→230 行）：移除 debug 日志、原地转向、cross-track error、Mocap/GPS 多位置源。障碍物检测改为深度图中央 ROI 最近深度判定。路径完成/障碍物持续 3s 时直接调用 `/trigger_llm_plan` 触发 Gemini 重规划。
+- 更新 `robot_vlm_launch.py` 参数（`scan_topic`→`depth_image_topic`，新增 ROI、深度范围等参数）。`my_robot_planner/package.xml` 新增 `cv_bridge` 依赖。
+
+## Apr.13, 2026 (续)
+- 架构方向变更：决定放弃本地 CNN 路线（语义分割、深度补全），转向 Gemini Function Calling Agent 架构。原因：Gemini 已具备视觉理解+语义标注能力，无需额外训练本地模型；深度相机硬件仍不稳定。
+- 新建 `future/function_calling_design.md`：完整的 Function Calling 架构设计文档，包含 `RobotTools` 工具类代码（7 个工具函数）、`tool_schemas.py` JSON Schema 定义、`agent_node.py` 多轮循环伪代码、耦合性分析、实施检查清单。
+- 重写 `PROCESS.md` Section 3：新 Step 7（Skill 系统提示词注入）、Step 8（Function Calling Agent 架构）、Step 9（Gemini 语义标签）、Step 10（Agent 集成测试）。原 Step 7-10 本地 CNN 计划用折叠标签归档保留。更新 Section 4 部署说明和目录结构。
+- 更新 `PROCESS.md` 硬件章节：精简 Orbbec Aurora 为"已弃用"摘要，新增 Gemini 2L 当前状态。
+- 新建 `future/skill_progressive_cognition.md`：渐进式场景认知 Skill 架构设计。三阶段模型（Scout 粗粒度区域探索 → Inspector 细粒度物体标注 → Navigator 精准导航），层级式语义标签数据结构（区域→物体→物品 + 拓扑连通图），Skill YAML 热插拔框架（加载器 + 3 个 Skill 文件），新增 9 个工具函数设计，完整使用场景示例。
+- 更新 `PROCESS.md` Step 9：从简单的语义标签改为渐进式场景认知与 Skill 切换架构，Step 10 同步更新。目录结构新增 `skill_progressive_cognition.md` 引用。
+- **实现 Skill 框架（Step 7 落地）：** 新建 `src/image_to_llm/skills/` 目录，含 `__init__.py`（Skill 加载器，`load_skill()`/`list_skills()`）和 `default.yaml`（从 `llm_config.env` 的 PROMPT 迁移而来的默认 Skill）。修改 `image_to_llm_node.py`：新增 `skill_name` 参数，从 YAML 加载 prompt 替代 env 中的 PROMPT；模型优先级为 env > YAML > 默认值。更新 `llm_node_launch.py` 支持 `skill_name:=xxx` 参数。更新 `setup.py` 注册 skills 包和 YAML data_files。精简 `llm_config.env` 仅保留 API_KEY 和代理。

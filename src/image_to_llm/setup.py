@@ -1,3 +1,5 @@
+import os
+from glob import glob
 from setuptools import find_packages, setup
 
 package_name = 'image_to_llm'
@@ -10,6 +12,11 @@ setup(
         ('share/ament_index/resource_index/packages',
             ['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
+        (os.path.join('share', package_name, 'launch'),
+            glob(os.path.join('launch', '*launch.[pxy][yma]*'))),
+        # Skill YAML 文件安装到 share 目录，同时也被 skills/__init__.py 直接从源码路径读取
+        (os.path.join('share', package_name, 'skills'),
+            glob(os.path.join('skills', '*.yaml'))),
     ],
     install_requires=['setuptools'],
     zip_safe=True,

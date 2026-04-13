@@ -38,6 +38,9 @@ The topic for getting pose of the robot from imu:
     - 'Imu, /agent0/imu' (its imu for webots robot, include: orientation, angular velocity, linear acceleration)
     - 'Imu, /imu' (real robot raw IMU data)
 
+The topic for LiDAR (2D laser scanner):
+    - 'LaserScan, /scan_raw' (2D laser scan from LiDAR. frame_id: lidar_frame. 360° coverage, 504 rays, 0.716° resolution, range: 0.06m~25m. Used by track_path for obstacle detection in the forward FOV)
+
 ## 3. ROS2 Nodes
 
 - 'Generate_Path': （Not use）This node is responsible for generating path points based on the starting point, ending point, and the desired path shape. It will publish the generated path points to the '/path' topic. (Optimization: To prevent blocking the ROS2 executor, user inputs for coordinates and shapes should be handled via a non-blocking separate thread, or ideally designed as a ROS2 Service/Action).

@@ -11,6 +11,7 @@ from cv_bridge import CvBridge
 import os
 import json
 import re
+import time
 import cv2
 from PIL import Image as PILImage
 from google import genai
@@ -26,22 +27,22 @@ class ImageToLLMNode(Node):
         self.declare_parameter('rgb_topic', '/depth_cam/rgb0/image_raw') 
         self.declare_parameter('pixel_path_topic', '/llm_pixels')
         self.declare_parameter('env_path', 'src/image_to_llm/llm_config.env')
+        self.declare_parameter('skill_name', 'default')
         
         rgb_topic = self.get_parameter('rgb_topic').value
         pixel_path_topic = self.get_parameter('pixel_path_topic').value
         env_path = self.get_parameter('env_path').value
+        skill_name = self.get_parameter('skill_name').value
         
-        # 尝试加载 .env 配置文件
+        # 尝试加载 .env 配置文件（API_KEY、代理等敏感信息）
         if os.path.exists(env_path):
             load_dotenv(env_path)
             self.get_logger().info(f"已加载配置文件: {env_path}")
         else:
             self.get_logger().warn(f"未找到配置文件: {env_path}, 将尝试使用系统的环境变量。请确保你创建了它避免泄露API KEY")
         
-        # 从环境变量提取敏感或可变配置
+        # 从环境变量提取敏感配置（API_KEY、代理）
         self.api_key = os.getenv('GEMINI_API_KEY', '')
-        self.model_name = os.getenv('GEMINI_MODEL', 'gemini-2.5-flash')
-        self.custom_prompt = os.getenv('PROMPT', '')
         http_proxy = os.getenv('HTTP_PROXY', '')
         https_proxy = os.getenv('HTTPS_PROXY', '')
         
@@ -53,6 +54,25 @@ class ImageToLLMNode(Node):
             os.environ["http_proxy"] = http_proxy
         if https_proxy:
             os.environ["https_proxy"] = https_proxy
+        
+        # 加载 Skill（prompt 和模型配置从 YAML 文件读取）
+        from image_to_llm.skills import load_skill, list_skills
+        try:
+            self.skill = load_skill(skill_name)
+            self.get_logger().info(f"已加载 Skill: '{self.skill.name}' — {self.skill.description}")
+        except FileNotFoundError as e:
+            self.get_logger().error(str(e))
+            self.get_logger().warn("将使用空 prompt 运行，可能无法正常工作")
+            self.skill = None
+        
+        # 模型优先级：env 中的 GEMINI_MODEL > Skill YAML 中的 model > 默认值
+        env_model = os.getenv('GEMINI_MODEL', '')
+        if env_model:
+            self.model_name = env_model
+        elif self.skill and self.skill.model:
+            self.model_name = self.skill.model
+        else:
+            self.model_name = 'gemini-2.5-flash'
         
         # 初始化 Gemini
         self.client = genai.Client(api_key=self.api_key)
@@ -71,14 +91,19 @@ class ImageToLLMNode(Node):
                                        callback_group=self._srv_cb_group)
         
         self.latest_rgb = None
+        self._rgb_ready_logged = False
         
         self.get_logger().info(f"Image_to_LLM Node 已启动... 模型: {self.model_name}")
         self.get_logger().info(f"订阅彩色图像: {rgb_topic}")
+        self.get_logger().info("⏳ 等待首帧 RGB 图像...")
         self.get_logger().info("触发命令: ros2 service call /trigger_llm_plan std_srvs/srv/Trigger")
 
     def rgb_callback(self, msg):
         try:
             self.latest_rgb = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            if not self._rgb_ready_logged:
+                self._rgb_ready_logged = True
+                self.get_logger().info("✅ 已收到首帧 RGB 图像，服务 /trigger_llm_plan 已就绪。")
         except Exception as e:
             self.get_logger().error(f"RGB 转换错误: {e}")
 
@@ -94,49 +119,68 @@ class ImageToLLMNode(Node):
         pil_img = PILImage.fromarray(cv_rgb)
         img_width, img_height = pil_img.size
         
-        # 将配置中写好的 prompt 格式化填入实际的图片长宽
-        if self.custom_prompt:
-            prompt = self.custom_prompt.replace('{width}', str(img_width)).replace('{height}', str(img_height))
-            # 处理配置文本中的转义换行符
-            prompt = prompt.replace('\\n', '\n')
+        # 从 Skill 获取 prompt，替换 {width}/{height} 占位符
+        if self.skill and self.skill.system_prompt:
+            prompt = self.skill.system_prompt.replace('{width}', str(img_width)).replace('{height}', str(img_height))
         else:
             prompt = f"图片实际尺寸为 {img_width}x{img_height}。请规划20个点..."
-            self.get_logger().warn("警告：未配置 PROMPT 环境变量")
+            self.get_logger().warn("警告：未加载 Skill 或 Skill 中无 system_prompt")
 
-        try:
-            llm_response = self.client.models.generate_content(
-                model=self.model_name,
-                contents=[prompt, pil_img]
-            )
-            raw_text = llm_response.text.strip()
-            
-            # 提取 JSON
-            json_str = raw_text
-            if json_str.startswith("```"):
-                json_str = re.sub(r'^```(?:json)?\s*', '', json_str)
-            if json_str.endswith("```"):
-                json_str = json_str[:-3]
-            json_str = json_str.strip()
-            json_match = re.search(r'\[.*\]', json_str, re.DOTALL)
-            if json_match:
-                json_str = json_match.group(0)
-            
-            # 先验证 JSON 合法性，再发布
-            parsed = json.loads(json_str)
-            
-            msg = String()
-            msg.data = json_str
-            self.pixel_pub.publish(msg)
-            
-            self.get_logger().info(f"Gemini 返回成功，已发布包含 {len(parsed)} 个像素点的 JSON。")
-            response.success = True
-            response.message = f"成功获取 {len(parsed)} 个点"
+        max_retries = 5
+        base_delay = 2.0  # 初始退避秒数
+
+        for attempt in range(1, max_retries + 1):
+            try:
+                llm_response = self.client.models.generate_content(
+                    model=self.model_name,
+                    contents=[prompt, pil_img]
+                )
+                raw_text = llm_response.text.strip()
                 
-        except Exception as e:
-            self.get_logger().error(f"LLM 错误：{e}")
-            response.success = False
-            response.message = str(e)
-            
+                # 提取 JSON
+                json_str = raw_text
+                if json_str.startswith("```"):
+                    json_str = re.sub(r'^```(?:json)?\s*', '', json_str)
+                if json_str.endswith("```"):
+                    json_str = json_str[:-3]
+                json_str = json_str.strip()
+                json_match = re.search(r'\[.*\]', json_str, re.DOTALL)
+                if json_match:
+                    json_str = json_match.group(0)
+                
+                # 先验证 JSON 合法性，再发布
+                parsed = json.loads(json_str)
+                
+                msg = String()
+                msg.data = json_str
+                self.pixel_pub.publish(msg)
+                
+                self.get_logger().info(f"Gemini 返回成功，已发布包含 {len(parsed)} 个像素点的 JSON。")
+                response.success = True
+                response.message = f"成功获取 {len(parsed)} 个点"
+                return response
+                    
+            except Exception as e:
+                error_str = str(e)
+                is_retryable = '503' in error_str or 'UNAVAILABLE' in error_str or '429' in error_str or 'RESOURCE_EXHAUSTED' in error_str
+                
+                if is_retryable and attempt < max_retries:
+                    delay = base_delay * (2 ** (attempt - 1))  # 指数退避: 2, 4, 8, 16s
+                    self.get_logger().warn(
+                        f"LLM 暂时不可用 (尝试 {attempt}/{max_retries})：{e}。"
+                        f"{delay:.0f} 秒后重试..."
+                    )
+                    time.sleep(delay)
+                    self.get_logger().info("向 Gemini 发送图像以获取像素路径点...")
+                else:
+                    self.get_logger().error(f"LLM 错误 (尝试 {attempt}/{max_retries})：{e}")
+                    response.success = False
+                    response.message = error_str
+                    return response
+        
+        # 理论上不会到达这里，但作为安全兜底
+        response.success = False
+        response.message = "已达最大重试次数"
         return response
 
 def main(args=None):
