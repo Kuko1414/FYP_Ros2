@@ -48,9 +48,9 @@ class TrackPath(Node):
         self.get_logger().info("Track Path node started")
 
         # ---- 参数 ----
-        self.declare_parameter('obstacle_distance', 0.8)
+        self.declare_parameter('obstacle_distance', 0.2)
         self.declare_parameter('obstacle_check_enabled', True)
-        self.declare_parameter('depth_image_topic', '/depth_cam/depth0/image_raw')
+        self.declare_parameter('depth_image_topic', '/camera/depth/image_raw')
         self.declare_parameter('obstacle_fov_deg', 60.0)
         self.declare_parameter('obstacle_roi_top_ratio', 0.3)
         self.declare_parameter('obstacle_roi_bottom_ratio', 0.8)
@@ -100,11 +100,12 @@ class TrackPath(Node):
         self._obstacle_immunity_until = 0.0
 
         # ---- PID ----
-        self.angular_pid = PIDController(kp=2.0, ki=0.1, kd=0.3,
-                                         output_min=-2.0, output_max=2.0)
-        self.linear_pid = PIDController(kp=0.5, ki=0.05, kd=0.1,
-                                        output_min=0.0, output_max=1.0)
+        self.angular_pid = PIDController(kp=0.6, ki=0.01, kd=0.1,
+                                         output_min=-1.0, output_max=1.0)
+        self.linear_pid = PIDController(kp=0.3, ki=0.01, kd=0.05,
+                                        output_min=0.0, output_max=0.35)
         self.last_control_time = None
+        self._prev_angle_error = 0.0  # 用于角度误差低通滤波
 
         # ---- 10Hz 控制循环 ----
         self.timer = self.create_timer(0.1, self.control_loop)
@@ -121,6 +122,10 @@ class TrackPath(Node):
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
 
+    def goal_callback(self, msg):
+        self.global_target = msg.pose.position
+        self.get_logger().info(f"📍 收到新的全局终点: ({self.global_target.x:.2f}, {self.global_target.y:.2f})")
+
     # ==================== 路径回调 ====================
 
     def path_callback(self, msg):
@@ -133,6 +138,7 @@ class TrackPath(Node):
         self.angular_pid.reset()
         self.linear_pid.reset()
         self.last_control_time = None
+        self._prev_angle_error = 0.0  # 重置低通滤波状态
         self.get_logger().info(f"收到新路径，共 {len(self.desired_path)} 个路径点")
 
     # ==================== 深度图障碍物检测 ====================
@@ -241,11 +247,18 @@ class TrackPath(Node):
         dx = target.x - curr_x
         dy = target.y - curr_y
         dist = math.hypot(dx, dy)
-        angle_error = math.atan2(math.sin(math.atan2(dy, dx) - self.current_yaw),
-                                 math.cos(math.atan2(dy, dx) - self.current_yaw))
+        raw_angle_error = math.atan2(math.sin(math.atan2(dy, dx) - self.current_yaw),
+                                     math.cos(math.atan2(dy, dx) - self.current_yaw))
+
+        # 低通滤波：平滑角度误差，抑制高频抖动（alpha=0.3 → 70% 旧值 + 30% 新值）
+        alpha = 0.3
+        angle_error = alpha * raw_angle_error + (1.0 - alpha) * self._prev_angle_error
+        self._prev_angle_error = angle_error
 
         angular_cmd = self.angular_pid.compute(angle_error, dt)
-        angle_factor = max(0.0, 1.0 - abs(angle_error) / math.pi)
+
+        # 余弦衰减：大角度误差时更激进地减速（比线性衰减更平滑）
+        angle_factor = max(0.0, math.cos(min(abs(angle_error), math.pi / 2.0)))
         linear_cmd = self.linear_pid.compute(dist, dt) * angle_factor
         if dist > 0.1 and linear_cmd < 0.03:
             linear_cmd = 0.03

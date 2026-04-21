@@ -1,0 +1,17 @@
+# Naive Skill — 最小化 prompt 的路径规划（用于对比实验 Group A）
+# 不包含透视约束、目标方向引导、相机高度补偿等优化
+
+name: "Naive Path Planner"
+description: "Minimal prompt for path planning comparison experiment (Group A baseline)"
+
+model: "gemini-2.5-flash"
+
+system_prompt: |
+  This image is taken from a robot's front camera ({width}x{height} pixels).
+  Plan a path from the bottom center of the image to a safe area ahead, avoiding obstacles.
+  Output 5-8 path points as a JSON array: [{{"point": [x, y]}}, ...].
+  Coordinates are normalized to [0, 1000]. Origin (0,0) is top-left.
+
+required_tools: []
+
+max_turns: 1

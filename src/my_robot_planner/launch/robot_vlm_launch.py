@@ -11,10 +11,26 @@
 """
 
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
 
 
 def generate_launch_description():
+
+    task_id_arg = DeclareLaunchArgument(
+        'task_id', default_value='-1',
+        description='实验 task 编号（>=0 时 conversion log 按 taskN 命名，-1 时用时间戳）'
+    )
+
+    # ---- 节点 0: 静态 TF 广播 (缝合底盘与相机的坐标系) ----
+    # 参数解释: x, y, z(抬高3.5厘米=总高度15.5cm), yaw, pitch, roll, parent_frame, child_frame
+    tf_camera_node = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='camera_static_tf',
+        arguments=['0.0', '0.0', '0.035', '0.0', '0.0', '0.0', 'camera_link0', 'camera_link']
+    )
 
     # ---- 节点 1: image_conversion ----
     image_conversion_node = Node(
@@ -24,16 +40,17 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'pixel_path_topic': '/llm_pixels',
-            'camera_info_topic': '/depth_cam/depth0/camera_info',
-            'depth_image_topic': '/depth_cam/depth0/image_raw',
+            'camera_info_topic': '/camera/depth/camera_info',
+            'depth_image_topic': '/camera/depth/image_raw',
             'odom_topic': '/odom',
             'path_topic': '/path',
             'depth_search_radius': 5,        # 深度采样窗口半径（像素）
             'min_valid_depth': 0.1,          # 最小有效深度（米）
             'max_valid_depth': 5.0,          # 最大有效深度（米）
             'ground_plane_fallback': True,    # 深度无效时使用地面平面假设
-            'camera_height': 0.15,           # 相机离地高度（米）
+            'camera_height': 0.155,           # 核心：使用真实的卡尺测量高度 155mm
             'camera_pitch': 0.0,             # 相机俯仰角（弧度，正值=向下）
+            'task_id': LaunchConfiguration('task_id'),
         }],
     )
 
@@ -44,8 +61,8 @@ def generate_launch_description():
         name='track_path',
         output='screen',
         parameters=[{
-            'depth_image_topic': '/depth_cam/depth0/image_raw',
-            'obstacle_distance': 0.8,
+            'depth_image_topic': '/camera/depth/image_raw',
+            'obstacle_distance': 0.20,
             'obstacle_check_enabled': True,
             'obstacle_fov_deg': 60.0,
             'obstacle_roi_top_ratio': 0.3,    # 障碍物检测 ROI 上边界（图像高度比例）
@@ -53,11 +70,13 @@ def generate_launch_description():
             'min_valid_depth': 0.1,
             'max_valid_depth': 5.0,
             'arrival_threshold': 0.15,
-            'lookahead_dist': 0.3,
+            'lookahead_dist': 0.3
         }],
     )
 
     return LaunchDescription([
+        task_id_arg,
+        tf_camera_node,
         image_conversion_node,
         track_path_node,
     ])

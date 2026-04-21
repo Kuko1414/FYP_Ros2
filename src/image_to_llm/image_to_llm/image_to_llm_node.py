@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, qos_profile_sensor_data
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from sensor_msgs.msg import Image
@@ -24,7 +25,7 @@ class ImageToLLMNode(Node):
         self.bridge = CvBridge()
         
         # 声明参数
-        self.declare_parameter('rgb_topic', '/depth_cam/rgb0/image_raw') 
+        self.declare_parameter('rgb_topic', '/camera/color/image_raw') 
         self.declare_parameter('pixel_path_topic', '/llm_pixels')
         self.declare_parameter('env_path', 'src/image_to_llm/llm_config.env')
         self.declare_parameter('skill_name', 'default')
@@ -80,8 +81,19 @@ class ImageToLLMNode(Node):
         # 回调组：将 service 放入独立的回调组，避免阻塞 rgb_callback
         self._srv_cb_group = MutuallyExclusiveCallbackGroup()
         
+        sensor_qos = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=1
+        )
+
         # 订阅彩色图片
-        self.sub_rgb = self.create_subscription(Image, rgb_topic, self.rgb_callback, 10)
+        self.sub_rgb = self.create_subscription(
+            Image, 
+            rgb_topic, 
+            self.rgb_callback, 
+            qos_profile_sensor_data
+        )
         
         # 发布 2D 像素 JSON
         self.pixel_pub = self.create_publisher(String, pixel_path_topic, 10)

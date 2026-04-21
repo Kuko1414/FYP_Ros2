@@ -14,10 +14,13 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'),
             glob(os.path.join('launch', '*launch.[pxy][yma]*'))),
-        # Skill YAML 文件安装到 share 目录，同时也被 skills/__init__.py 直接从源码路径读取
+        # Skill YAML 文件安装到 share 目录
         (os.path.join('share', package_name, 'skills'),
-            glob(os.path.join('skills', '*.yaml'))),
+            glob(os.path.join('image_to_llm', 'skills', '*.yaml'))),
     ],
+    package_data={
+        'image_to_llm': ['skills/*.yaml'],
+    },
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='kuko',

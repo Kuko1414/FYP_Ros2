@@ -79,3 +79,23 @@ For AI coding agents. This is a record of each change made to the workspace cont
 - 新建 `future/skill_progressive_cognition.md`：渐进式场景认知 Skill 架构设计。三阶段模型（Scout 粗粒度区域探索 → Inspector 细粒度物体标注 → Navigator 精准导航），层级式语义标签数据结构（区域→物体→物品 + 拓扑连通图），Skill YAML 热插拔框架（加载器 + 3 个 Skill 文件），新增 9 个工具函数设计，完整使用场景示例。
 - 更新 `PROCESS.md` Step 9：从简单的语义标签改为渐进式场景认知与 Skill 切换架构，Step 10 同步更新。目录结构新增 `skill_progressive_cognition.md` 引用。
 - **实现 Skill 框架（Step 7 落地）：** 新建 `src/image_to_llm/skills/` 目录，含 `__init__.py`（Skill 加载器，`load_skill()`/`list_skills()`）和 `default.yaml`（从 `llm_config.env` 的 PROMPT 迁移而来的默认 Skill）。修改 `image_to_llm_node.py`：新增 `skill_name` 参数，从 YAML 加载 prompt 替代 env 中的 PROMPT；模型优先级为 env > YAML > 默认值。更新 `llm_node_launch.py` 支持 `skill_name:=xxx` 参数。更新 `setup.py` 注册 skills 包和 YAML data_files。精简 `llm_config.env` 仅保留 API_KEY 和代理。
+
+## Apr.14, 2026
+- **更换深度相机后话题适配：** 临时使用 Intel D435（后续将换为奥比中光 Gemini 336），ROS2 驱动话题命名与旧 Aurora 不同，更新了所有 launch 文件中的话题参数：RGB `→ /camera/color/image_raw`，深度图 `→ /camera/depth/image_raw`，camera_info `→ /camera/depth/camera_info`。涉及 `llm_node_launch.py` 和 `robot_vlm_launch.py`。同步更新 `ARCHITECTURE.md` 话题文档。注意：换 Gemini 336 后话题名可能再次变化，届时需重新适配。
+- **修复 skills 模块 import 失败：** `skills/` 原来放在包根目录（与 `image_to_llm/` 并列），被 setuptools 安装为独立顶层包，导致 `from image_to_llm.skills import ...` 找不到。将 `skills/` 移至 `image_to_llm/image_to_llm/skills/` 使其成为子包，并在 `setup.py` 添加 `package_data` 确保 `.yaml` 文件随包安装。
+- **端到端坐标转换验证通过：** 手动发布测试像素点到 `/llm_pixels`，`image_conversion` 成功用深度反投影生成 odom 路径点。D435 深度图有效率 68.8%，远优于旧 Aurora（~10%）。验证日志：`data/log/conversion_20260414_221336.log`。
+
+## Apr.15, 2026
+- **PID 抗振荡调参（`track_path.py`）：** 实测发现小车沿路径剧烈振荡（yaw ±54°），根因是角速度 PID 的 kd=0.6 过大导致 D 项过度反应。调整：angular kp 1.0→0.6, ki 0.02→0.01, kd 0.6→0.1；linear kp 0.4→0.3, ki 0.02→0.01, kd 0.1→0.05；lookahead_dist 0.6→0.3m。新增角度误差低通滤波（alpha=0.3）和余弦衰减减速策略。实测振荡完全消除，yaw 振幅降至 ±3°。
+- **修复坐标转换左右镜像 bug（`image_conversion.py`）：** `_camera_to_odom` 公式中 cam_x 符号错误，相机"右侧"被映射到 odom 的"左侧"。修正：`-cam_x*sin(yaw)` → `+cam_x*sin(yaw)`，`+cam_x*cos(yaw)` → `-cam_x*cos(yaw)`。实测确认小车现在正确地往图像右侧方向行驶。
+- **深度图就绪检查加强（`image_conversion.py`）：** `pixel_callback` 原来只检查 camera_info + yaw 稳定，未检查深度图是否就绪，导致路径全部使用不准确的地面假设 fallback。现在三者全部就绪才处理像素消息，否则缓存等待自动处理。
+
+## Apr.15, 2026
+- **修复路径方向错误（根因：IMU/odom yaw 启动不稳定）：** 通过 `data/test_odom_yaw.py` 测试脚本验证发现，odom 启动初期 yaw 会从 0° 剧烈跳动后收敛到真实值（~149°），而 `image_conversion` 在 yaw 未稳定时就执行了坐标转换（yaw=-5.8°），导致路径方向完全错误。在 `image_conversion.py` 中新增 **yaw 稳定性检查**：用 `deque` 记录最近 3 秒 yaw 历史，当变化幅度 < 2° 时才标记就绪。不硬编码任何角度值，适用于任何朝向/场景。修复后路径方向与实际移动方向差值从 ~150° 降至 ~1°。
+- **新增位姿记录器 `data/pose_logger.py`：** 每 0.5s 采样 odom (x, y, yaw)，Ctrl+C 退出时自动保存到 `data/log/pose_YYYYMMDD_HHMMSS.log`，含汇总（起终点、总位移、移动方向角）和详细轨迹表格，用于 PID 调参和路径 debug。
+- **PID 调参（进行中）：** 原参数 angular(kp=2.0, ki=0.1, kd=0.3) 导致严重 S 型振荡（yaw 振幅 ~60°）。第一轮调为 (1.2, 0.02, 0.5)，振幅降至前半段 ~11°、后半段 ~42°。第二轮调为 (1.0, 0.02, 0.6)，angular max 1.2，linear max 0.4，lookahead 0.3→0.6，待测试验证。
+
+## Apr.19, 2026
+- **解决 Jetson 宕机与轨迹边沿跳变**：调低 Orin 功耗与分辨率解决相机启动死机；优化 `default.yaml` 提示词禁止大模型跨越障碍物生成路点。
+- **引入 TF2 重构由于机械误差导致的坐标漂移偏移**：在 `robot_vlm_launch.py` 注入实测高度（Z=155mm）的静态 TF 树。重构 `image_conversion.py`，彻底废除手动 `odom` 订阅和三角函数算姿态，转用 `tf2_ros.TransformListener`。此修改通过依赖系统级 TF 树计算深度流像素的级联空间矩阵，完美解决了路点一直错位到“车轮下”的追踪异常。
+- **完善端到端纯视觉导航闭环（到达终点门）**：修复了 `image_conversion.py` 中 TF 缓冲区对未来时间戳的外推报错（强制 stamp=0）。在 `robot_vlm_launch.py` 中将 `obstacle_distance` 安全距离缩小至 0.2m 防止提前误刹车。去除了 `track_path.py` 中所有硬编码的绝对坐标与原地旋转逻辑。在 `default.yaml` 的提示词中，向大模型引入了相机极低安装高度带来的“透视原理”约束，强制大模型将局部路径点纵深规划到画面中上方（Y在500~550附近），成功将单次步进距离从0.3m提升至1.5m~2m。通过纯粹的“拍摄->生成平滑短曲线->循迹->再拍摄”闭环，实现了自然平滑的转向与长距离避障，最终成功引导小车到达走廊门前。

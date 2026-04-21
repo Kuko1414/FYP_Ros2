@@ -27,7 +27,7 @@ def generate_launch_description():
         name='image_to_llm_node',
         output='screen',
         parameters=[{
-            'rgb_topic': '/depth_cam/rgb0/image_raw',
+            'rgb_topic': '/camera/color/image_raw',
             'pixel_path_topic': '/llm_pixels',
             'env_path': 'src/image_to_llm/llm_config.env',
             'skill_name': LaunchConfiguration('skill_name'),

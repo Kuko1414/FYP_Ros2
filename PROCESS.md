@@ -29,9 +29,9 @@ To achieve this powerful function, the design concept is as follows, ONLY WHEN I
 
 The Orbbec Aurora (structured light) was diagnosed on Apr.10, 2026 with ~90% zero-value pixels when mounted at the robot's low height (~11cm). Root cause: near-parallel incidence angles on smooth tile floor. This camera has been **replaced**.
 
-### Orbbec Gemini 2L（当前使用，Apr.13 更换）
+### Intel D435（临时使用）→ Orbbec Gemini 336（计划更换）
 
-On Apr.13, 2026, the depth camera was replaced with **Orbbec Gemini 2L (stereo)**. Key changes:
+On Apr.14, 2026, temporarily using **Intel RealSense D435** for testing. Will switch to **Orbbec Gemini 336** soon. Key changes from Aurora era:
 - `image_conversion.py` was rewritten to use **pinhole camera model reprojection** (depth image + camera_info intrinsics), removing the previous PointCloud-based approach.
 - `track_path.py` obstacle detection switched from LiDAR/PointCloud to **depth image central ROI** minimum depth.
 - All depth-related topics remain the same (`/depth_cam/depth0/image_raw`, `/depth_cam/depth0/camera_info`).
@@ -54,15 +54,15 @@ On Apr.13, 2026, the depth camera was replaced with **Orbbec Gemini 2L (stereo)*
 **Goal:** 通过精心设计的系统提示词（System Prompt）赋予 Gemini 特定的"技能"，使其从"看图出点"升级为"带着任务理解和语义知识看图"。
 
 **Problem Being Solved:**
-  - 当前 `image_to_llm_node` 发给 Gemini 的 prompt 只是简单的"规划路径点"，缺乏任务上下文
-  - Gemini 不知道机器人的当前位置、已探索区域、环境语义信息
-  - 每次调用都是独立的，没有跨调用的记忆
+  - 当前 `image_to_llm_node` 发给 Gemini 的 prompt 只是简单的"规划路径点"，缺乏 任务上下文。
+  - Gemini 因相机安装高度带来的透视问题，容易规划过短的距离。
+  - 需要在单纯依靠纯追踪（Pure Pursuit）而不人工硬编码偏航（Yaw）转向逻辑的前提下，靠视觉连续引导向目标（如门口）前进。
 
 **Implementation:**
-  - 在 `llm_config.env` 的 PROMPT 中注入结构化的系统提示词，包含：
-    - 机器人角色定义（"你是一个熟练的室内导航机器人领航员"）
-    - 坐标系说明（图像坐标 vs odom 坐标的关系）
-    - 语义标注规则（"在规划路径时，同时标注你观察到的区域功能"）
+  - 修改 `default.yaml` 技能文件：
+    - 针对相机的低仰角透视，指示其在图像中上方（Y在500~550）落点，从而实现一次生成 1.5 到 2 米的路径。
+    - 指导大模型平滑转弯并对齐长远目标（如“右方走廊的门”），利用大模型本身生成的平滑贝塞尔路线，依靠底层的 Pure Pursuit 实现自然偏航对齐。
+- **Status:** **Completed**
     - 输出格式要求（路径点 + 语义标签的 JSON 格式）
   - 示例输出格式：
     ```json

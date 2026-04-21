@@ -17,12 +17,19 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from sensor_msgs.msg import CameraInfo, Image
 from nav_msgs.msg import Path, Odometry
 from std_msgs.msg import String
-from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import PoseStamped, PointStamped
+
+import tf2_ros
+import tf2_geometry_msgs
+from tf2_ros.buffer import Buffer
+from tf2_ros.transform_listener import TransformListener
 
 import json
 import math
 import os
+import time
 import numpy as np
+from collections import deque
 from datetime import datetime
 from cv_bridge import CvBridge
 
@@ -33,8 +40,8 @@ class ImageConversionNode(Node):
 
         # ---- 参数声明 ----
         self.declare_parameter('pixel_path_topic', '/llm_pixels')
-        self.declare_parameter('camera_info_topic', '/depth_cam/depth0/camera_info')
-        self.declare_parameter('depth_image_topic', '/depth_cam/depth0/image_raw')
+        self.declare_parameter('camera_info_topic', '/camera/depth/camera_info')
+        self.declare_parameter('depth_image_topic', '/camera/depth/image_raw')
         self.declare_parameter('odom_topic', '/odom')
         self.declare_parameter('path_topic', '/path')
         self.declare_parameter('depth_search_radius', 5)       # 深度采样窗口半径（像素）
@@ -44,11 +51,13 @@ class ImageConversionNode(Node):
         self.declare_parameter('camera_height', 0.15)           # 相机离地高度（米），用于地面平面 fallback
         self.declare_parameter('camera_pitch', 0.0)             # 相机俯仰角（弧度，正值=向下），用于地面平面 fallback
         self.declare_parameter('log_dir', '/home/kuko/humble_ws/data/log')
+        self.declare_parameter('task_id', -1)  # task 编号，-1 表示使用时间戳命名
 
         pixel_path_topic = self.get_parameter('pixel_path_topic').value
         camera_info_topic = self.get_parameter('camera_info_topic').value
         depth_image_topic = self.get_parameter('depth_image_topic').value
         odom_topic = self.get_parameter('odom_topic').value
+        self.odom_frame = odom_topic.lstrip('/')
         path_topic = self.get_parameter('path_topic').value
         self.depth_search_radius = self.get_parameter('depth_search_radius').value
         self.min_valid_depth = self.get_parameter('min_valid_depth').value
@@ -57,6 +66,8 @@ class ImageConversionNode(Node):
         self.camera_height = self.get_parameter('camera_height').value
         self.camera_pitch = self.get_parameter('camera_pitch').value
         self.log_dir = self.get_parameter('log_dir').value
+        self.task_id = self.get_parameter('task_id').value
+        self._conversion_count = 0  # 当前 task 内的第几次转换
         os.makedirs(self.log_dir, exist_ok=True)
 
         # ---- 内参（从 camera_info 动态获取）----
@@ -68,15 +79,15 @@ class ImageConversionNode(Node):
         self.img_height = None
         self.camera_info_received = False
 
+        # ROS 2 TF 配置
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
         # ---- 深度图数据 ----
         self.latest_depth = None       # numpy array, 单位：米（float）
         self.depth_received = False
         self.bridge = CvBridge()
-
-        # ---- Odom 数据 ----
-        self.current_x = None
-        self.current_y = None
-        self.current_yaw = None
+        self.latest_depth_stamp = None # 保存时间戳
 
         # ---- 就绪状态 ----
         self._ready_logged = False
@@ -91,11 +102,9 @@ class ImageConversionNode(Node):
 
         # ---- 订阅 ----
         self.sub_camera_info = self.create_subscription(
-            CameraInfo, camera_info_topic, self.camera_info_callback, 10)
+            CameraInfo, camera_info_topic, self.camera_info_callback, sensor_qos)
         self.sub_depth = self.create_subscription(
             Image, depth_image_topic, self.depth_callback, sensor_qos)
-        self.sub_odom = self.create_subscription(
-            Odometry, odom_topic, self.odom_callback, 10)
         self.sub_pixels = self.create_subscription(
             String, pixel_path_topic, self.pixel_callback, 10)
 
@@ -159,27 +168,19 @@ class ImageConversionNode(Node):
                     f"encoding={msg.encoding}, "
                     f"有效像素: {valid_count}/{total} ({valid_count/total*100:.1f}%)")
                 self._check_ready()
+            
+            # 保存时间戳供后续 TF 转换使用
+            self.latest_depth_stamp = msg.header.stamp
         except Exception as e:
             self.get_logger().error(f"深度图转换错误: {e}", throttle_duration_sec=5.0)
-
-    def odom_callback(self, msg):
-        p = msg.pose.pose.position
-        q = msg.pose.pose.orientation
-        self.current_x = p.x
-        self.current_y = p.y
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
-        if not self._ready_logged:
-            self._check_ready()
 
     def _check_ready(self):
         if self._ready_logged:
             return
-        if self.camera_info_received and self.depth_received and self.current_yaw is not None:
+        if self.camera_info_received and self.depth_received:
             self._ready_logged = True
             self.get_logger().info(
-                "✅ camera_info + 深度图 + odom 均已就绪，准备接收 /llm_pixels。")
+                f"✅ camera_info + 深度图 均已就绪，准备接收 /llm_pixels。")
             if self._pending_pixel_msg is not None:
                 self.get_logger().info("📦 正在处理缓存的像素消息...")
                 pending = self._pending_pixel_msg
@@ -287,41 +288,20 @@ class ImageConversionNode(Node):
         return cam_x, cam_y, cam_z
 
     # ================================================================
-    #  相机坐标系 → odom 坐标系
-    # ================================================================
-
-    def _camera_to_odom(self, cam_x, cam_y, cam_z):
-        """将相机坐标系的 3D 点转换到 odom 坐标系。
-        
-        假设相机朝前安装（与机器人前进方向一致）：
-          相机 Z（前）→ odom 中机器人前进方向
-          相机 X（右）→ odom 中机器人右侧方向
-          
-        转换：
-          odom_x = robot_x + cam_z * cos(yaw) - cam_x * sin(yaw)
-          odom_y = robot_y + cam_z * sin(yaw) + cam_x * cos(yaw)
-          
-        Returns:
-            (odom_x, odom_y)
-        """
-        cos_yaw = math.cos(self.current_yaw)
-        sin_yaw = math.sin(self.current_yaw)
-
-        odom_x = self.current_x + cam_z * cos_yaw - cam_x * sin_yaw
-        odom_y = self.current_y + cam_z * sin_yaw + cam_x * cos_yaw
-
-        return odom_x, odom_y
-
-    # ================================================================
     #  主逻辑：像素消息处理
     # ================================================================
 
     def pixel_callback(self, msg):
-        # 检查就绪
-        if not self.camera_info_received or self.current_yaw is None:
+        # 检查就绪（camera_info + 深度图 全部就绪才处理）
+        if not self.camera_info_received or not self.depth_received:
+            reasons = []
+            if not self.camera_info_received:
+                reasons.append("camera_info")
+            if not self.depth_received:
+                reasons.append("深度图")
             if self._pending_pixel_msg is None:
                 self.get_logger().warn(
-                    "收到 LLM 像素，但数据源尚未就绪，已缓存等待就绪后自动处理。")
+                    f"收到 LLM 像素，但 {'+'.join(reasons)} 尚未就绪，已缓存等待就绪后自动处理。")
             self._pending_pixel_msg = msg
             return
 
@@ -337,7 +317,7 @@ class ImageConversionNode(Node):
         now_stamp = self.get_clock().now().to_msg()
         path_msg = Path()
         path_msg.header.stamp = now_stamp
-        path_msg.header.frame_id = 'odom'
+        path_msg.header.frame_id = self.odom_frame
 
         conversion_details = []  # 用于 debug 日志
 
@@ -373,12 +353,33 @@ class ImageConversionNode(Node):
             if method == 'depth':
                 cam_x, cam_y, cam_z = self._pixel_to_camera_3d(u, v, depth_m)
 
-            # 转换到 odom 坐标系
-            odom_x, odom_y = self._camera_to_odom(cam_x, cam_y, cam_z)
+            # 构造带时间戳的相机坐标点
+            pt_cam = PointStamped()
+            # 解决TF extrapolation into the future错误：使用最新可用的TF（stamp赋为0）
+            pt_cam.header.stamp.sec = 0
+            pt_cam.header.stamp.nanosec = 0
+            pt_cam.header.frame_id = 'camera_depth_optical_frame'
+            pt_cam.point.x = float(cam_x)
+            pt_cam.point.y = float(cam_y)
+            pt_cam.point.z = float(cam_z)
+
+            try:
+                # 使用 TF2 进行转换: camera *optical* frame => odom frame
+                # rclpy.duration.Duration 的 timeout 可以稍微解决一些历史树的抖动
+                pt_odom = self.tf_buffer.transform(pt_cam, self.odom_frame, timeout=rclpy.duration.Duration(seconds=0.1))
+                odom_x = pt_odom.point.x
+                odom_y = pt_odom.point.y
+            except Exception as e:
+                self.get_logger().warn(f"无法将点从 {pt_cam.header.frame_id} 转换到 {self.odom_frame}: {e}")
+                conversion_details.append({
+                    'idx': i, 'raw': (pt[0], pt[1]), 'decoded': (u, v),
+                    'depth': depth_m, 'method': 'TF_FAILED', 'reason': str(e)
+                })
+                continue
 
             pose = PoseStamped()
             pose.header.stamp = now_stamp
-            pose.header.frame_id = 'odom'
+            pose.header.frame_id = self.odom_frame
             pose.pose.position.x = odom_x
             pose.pose.position.y = odom_y
             pose.pose.position.z = 0.0
@@ -414,8 +415,13 @@ class ImageConversionNode(Node):
     def _write_debug_log(self, points_data, conversion_details, poses):
         """将每次路径转换的详细信息写入 data/log/ 目录。"""
         try:
-            ts = datetime.now().strftime('%Y%m%d_%H%M%S')
-            log_path = os.path.join(self.log_dir, f'conversion_{ts}.log')
+            # 根据 task_id 决定文件名：task_id >= 0 时用 task 编号，否则用时间戳
+            if self.task_id >= 0:
+                self._conversion_count += 1
+                log_path = os.path.join(self.log_dir, f'conversion_task{self.task_id}_{self._conversion_count}.log')
+            else:
+                ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+                log_path = os.path.join(self.log_dir, f'conversion_{ts}.log')
 
             lines = []
             lines.append(f"=== Image Conversion Debug Log (深度相机反投影模式) ===")
@@ -423,8 +429,6 @@ class ImageConversionNode(Node):
             lines.append(f"相机内参: fx={self.fx:.2f}, fy={self.fy:.2f}, "
                          f"cx={self.cx:.2f}, cy={self.cy:.2f}, "
                          f"分辨率={self.img_width}x{self.img_height}")
-            lines.append(f"当前位置: x={self.current_x:.4f}, y={self.current_y:.4f}, "
-                         f"yaw={math.degrees(self.current_yaw):.1f}°")
             lines.append(f"参数: depth_search_radius={self.depth_search_radius}, "
                          f"min_depth={self.min_valid_depth}m, max_depth={self.max_valid_depth}m, "
                          f"ground_fallback={self.ground_plane_fallback}")
