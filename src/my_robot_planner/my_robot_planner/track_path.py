@@ -1,84 +1,75 @@
 """
-track_path 节点：PID 路径追踪 + 深度图障碍物检测。
+track_path 节点：纯目标追踪 + 斥力场（Potential Field）避障。
 
 核心逻辑：
-  1. 订阅 /path 获取路径点，用 Pure Pursuit + PID 追踪
-  2. 订阅深度图检测正前方障碍物，检测到则停车并触发 Gemini 重规划
-  3. 路径完成后自动触发 Gemini 请求下一段路径
+  1. 订阅 /goal_point 获取 Gemini 发布的单个目标点（odom 绝对坐标）
+  2. 订阅 /scan_raw（2D 雷达 LaserScan）实时获取障碍物距离
+  3. 10Hz 控制循环：
+     - 计算目标方向角（局部坐标系）作为吸引力方向
+     - 270°（前方±135°）雷达斥力场：近距离障碍物产生反方向推力，防撞
+     - 吸引力 + 斥力 合成最终行驶方向
+  4. 到达目标点（< 阈值）时停车，触发 Gemini 下一轮
+  5. 雷达正前方检测到极近障碍物（< emergency_dist）时紧急停车
 """
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy
 from geometry_msgs.msg import PoseStamped, Twist
-from nav_msgs.msg import Path, Odometry
-from sensor_msgs.msg import Image
+from nav_msgs.msg import Odometry
+from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Trigger
-from cv_bridge import CvBridge
-import numpy as np
 import math
 import time
-
-
-class PIDController:
-    """Simple PID controller with anti-windup."""
-    def __init__(self, kp, ki, kd, output_min=-float('inf'), output_max=float('inf'), integral_max=1.0):
-        self.kp, self.ki, self.kd = kp, ki, kd
-        self.output_min, self.output_max = output_min, output_max
-        self.integral_max = integral_max
-        self.prev_error = 0.0
-        self.integral = 0.0
-
-    def reset(self):
-        self.prev_error = 0.0
-        self.integral = 0.0
-
-    def compute(self, error, dt):
-        if dt <= 0:
-            return 0.0
-        self.integral = max(-self.integral_max, min(self.integral_max, self.integral + error * dt))
-        derivative = (error - self.prev_error) / dt
-        self.prev_error = error
-        output = self.kp * error + self.ki * self.integral + self.kd * derivative
-        return max(self.output_min, min(self.output_max, output))
 
 
 class TrackPath(Node):
     def __init__(self):
         super().__init__('track_path')
-        self.get_logger().info("Track Path node started")
+        self.get_logger().info("Track Path node started (Attract+Repulse Navigation mode)")
 
         # ---- 参数 ----
-        self.declare_parameter('obstacle_distance', 0.2)
-        self.declare_parameter('obstacle_check_enabled', True)
-        self.declare_parameter('depth_image_topic', '/camera/depth/image_raw')
-        self.declare_parameter('obstacle_fov_deg', 60.0)
-        self.declare_parameter('obstacle_roi_top_ratio', 0.3)
-        self.declare_parameter('obstacle_roi_bottom_ratio', 0.8)
-        self.declare_parameter('min_valid_depth', 0.1)
-        self.declare_parameter('max_valid_depth', 5.0)
-        self.declare_parameter('arrival_threshold', 0.15)
-        self.declare_parameter('lookahead_dist', 0.3)
+        # 紧急停车
+        self.declare_parameter('emergency_dist', 0.15)     # 紧急停车距离（米）
+        self.declare_parameter('emergency_fov_deg', 60.0)  # 紧急停车检测 FOV（度）
 
-        self.obstacle_distance = self.get_parameter('obstacle_distance').value
-        self.obstacle_check_enabled = self.get_parameter('obstacle_check_enabled').value
+        # 斥力场参数（270° 防撞）
+        self.declare_parameter('repulse_fov_deg', 270.0)     # 斥力场检测 FOV（度），前方 ±135°
+        self.declare_parameter('repulse_dist', 0.7)          # 斥力场外缘生效距离（米）
+        self.declare_parameter('repulse_gain', 0.8)          # 斥力场增益
+
+        # 运动限制
+        self.declare_parameter('max_linear_vel', 0.3)
+        self.declare_parameter('max_angular_vel', 1.0)
+        self.declare_parameter('min_linear_vel', 0.03)
+
+        # 目标到达
+        self.declare_parameter('arrival_threshold', 0.3)
+
+        # 雷达话题
+        self.declare_parameter('scan_topic', '/scan_raw')
+
+        self.emergency_dist = self.get_parameter('emergency_dist').value
+        self.emergency_fov_deg = self.get_parameter('emergency_fov_deg').value
+        self.repulse_fov_deg = self.get_parameter('repulse_fov_deg').value
+        self.repulse_dist = self.get_parameter('repulse_dist').value
+        self.repulse_gain = self.get_parameter('repulse_gain').value
+        self.max_linear_vel = self.get_parameter('max_linear_vel').value
+        self.max_angular_vel = self.get_parameter('max_angular_vel').value
+        self.min_linear_vel = self.get_parameter('min_linear_vel').value
         self.arrival_threshold = self.get_parameter('arrival_threshold').value
-        self.lookahead_dist = self.get_parameter('lookahead_dist').value
-        self.obstacle_fov_rad = math.radians(self.get_parameter('obstacle_fov_deg').value)
-        self.obstacle_roi_top = self.get_parameter('obstacle_roi_top_ratio').value
-        self.obstacle_roi_bottom = self.get_parameter('obstacle_roi_bottom_ratio').value
-        self.min_valid_depth = self.get_parameter('min_valid_depth').value
-        self.max_valid_depth = self.get_parameter('max_valid_depth').value
+        scan_topic = self.get_parameter('scan_topic').value
 
         # ---- 订阅 ----
-        self.path_sub = self.create_subscription(Path, '/path', self.path_callback, 10)
-        self.sub_odom = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
+        self.sub_odom = self.create_subscription(
+            Odometry, '/odom', self.odom_callback, 10)
+        self.sub_goal = self.create_subscription(
+            PoseStamped, '/goal_point', self.goal_callback, 10)
 
-        depth_topic = self.get_parameter('depth_image_topic').value
-        sensor_qos = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            history=HistoryPolicy.KEEP_LAST, depth=1)
-        self.sub_depth = self.create_subscription(
-            Image, depth_topic, self.depth_obstacle_callback, sensor_qos)
+        scan_qos = QoSProfile(
+            reliability=ReliabilityPolicy.RELIABLE,
+            history=HistoryPolicy.KEEP_LAST, depth=5)
+        self.sub_scan = self.create_subscription(
+            LaserScan, scan_topic, self.scan_callback, scan_qos)
 
         # ---- 发布 ----
         self.cmd_pub1 = self.create_publisher(Twist, '/cmd_vel', 10)
@@ -88,181 +79,240 @@ class TrackPath(Node):
         self.trigger_client = self.create_client(Trigger, '/trigger_llm_plan')
 
         # ---- 状态 ----
-        self.bridge = CvBridge()
-        self.desired_path = None
-        self.current_target_idx = 0
-        self.current_pose = None
+        self.current_x = None
+        self.current_y = None
         self.current_yaw = None
-        self.path_completed = False
-        self.obstacle_detected = False
-        self._obstacle_detect_time = 0.0
-        self._obstacle_replan_triggered = False
-        self._obstacle_immunity_until = 0.0
+        self.goal_x = None
+        self.goal_y = None
+        self.goal_active = False
+        self.latest_scan = None
+        self._goal_reached_logged = False
 
-        # ---- PID ----
-        self.angular_pid = PIDController(kp=0.6, ki=0.01, kd=0.1,
-                                         output_min=-1.0, output_max=1.0)
-        self.linear_pid = PIDController(kp=0.3, ki=0.01, kd=0.05,
-                                        output_min=0.0, output_max=0.35)
-        self.last_control_time = None
-        self._prev_angle_error = 0.0  # 用于角度误差低通滤波
+        # ---- 卡住检测 ----
+        self._stuck_start_time = None
+        self._stuck_timeout = 5.0
+        self._replan_cooldown = 10.0
+        self._last_replan_time = 0.0
 
         # ---- 10Hz 控制循环 ----
         self.timer = self.create_timer(0.1, self.control_loop)
 
-    # ==================== 位置回调 ====================
+    # ==================== 回调 ====================
 
     def odom_callback(self, msg):
-        pose_msg = PoseStamped()
-        pose_msg.header = msg.header
-        pose_msg.pose = msg.pose.pose
-        self.current_pose = pose_msg
+        self.current_x = msg.pose.pose.position.x
+        self.current_y = msg.pose.pose.position.y
         q = msg.pose.pose.orientation
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         self.current_yaw = math.atan2(siny_cosp, cosy_cosp)
 
     def goal_callback(self, msg):
-        self.global_target = msg.pose.position
-        self.get_logger().info(f"📍 收到新的全局终点: ({self.global_target.x:.2f}, {self.global_target.y:.2f})")
+        """接收 Gemini 发布的单个目标点。"""
+        self.goal_x = msg.pose.position.x
+        self.goal_y = msg.pose.position.y
+        self.goal_active = True
+        self._goal_reached_logged = False
+        self.get_logger().info(
+            f"📍 收到新目标点: ({self.goal_x:.2f}, {self.goal_y:.2f})")
 
-    # ==================== 路径回调 ====================
+    def scan_callback(self, msg):
+        """缓存最新的雷达数据。"""
+        self.latest_scan = msg
 
-    def path_callback(self, msg):
-        self.desired_path = msg.poses
-        self.current_target_idx = 0
-        self.path_completed = False
-        self.obstacle_detected = False
-        self._obstacle_replan_triggered = False
-        self._obstacle_immunity_until = time.monotonic() + 2.0
-        self.angular_pid.reset()
-        self.linear_pid.reset()
-        self.last_control_time = None
-        self._prev_angle_error = 0.0  # 重置低通滤波状态
-        self.get_logger().info(f"收到新路径，共 {len(self.desired_path)} 个路径点")
+    # ==================== 核心方法 ====================
 
-    # ==================== 深度图障碍物检测 ====================
+    def _get_goal_angle_local(self):
+        """计算目标点相对于机器人朝向的角度（局部坐标系）。"""
+        dx = self.goal_x - self.current_x
+        dy = self.goal_y - self.current_y
+        goal_angle_global = math.atan2(dy, dx)
+        angle_diff = goal_angle_global - self.current_yaw
+        return math.atan2(math.sin(angle_diff), math.cos(angle_diff))
 
-    def depth_obstacle_callback(self, msg: Image):
-        if not self.obstacle_check_enabled:
-            return
-        if self.desired_path is None or self.path_completed:
-            return
-        if time.monotonic() < self._obstacle_immunity_until:
-            return
+    def _check_emergency(self):
+        """检查前方是否有极近障碍物需要紧急停车。"""
+        if self.latest_scan is None:
+            return False
 
-        min_dist = self._get_min_depth(msg)
-        if min_dist is None:
-            if self.obstacle_detected:
-                self.obstacle_detected = False
-                self.get_logger().info("✅ 障碍物已清除，恢复跟踪")
-            return
+        scan = self.latest_scan
+        emergency_fov_rad = math.radians(self.emergency_fov_deg)
 
-        if min_dist < self.obstacle_distance:
-            if not self.obstacle_detected:
-                self.obstacle_detected = True
-                self._obstacle_detect_time = time.monotonic()
-                self.stop_robot()
-                self.get_logger().warn(
-                    f"⚠️ 障碍物！距离: {min_dist:.2f}m < {self.obstacle_distance:.2f}m，停车")
-            elif time.monotonic() - self._obstacle_detect_time > 3.0 and not self._obstacle_replan_triggered:
-                self._obstacle_replan_triggered = True
-                self.get_logger().info("🔄 障碍物持续 3s，触发 Gemini 重规划")
-                self._trigger_replan()
+        for i in range(len(scan.ranges)):
+            r = scan.ranges[i]
+            angle = scan.angle_min + i * scan.angle_increment
+            angle = math.atan2(math.sin(angle), math.cos(angle))
+
+            if abs(angle) > emergency_fov_rad / 2.0:
+                continue
+            if r < scan.range_min or r > scan.range_max or math.isinf(r) or math.isnan(r):
+                continue
+            if r < self.emergency_dist:
+                return True
+
+        return False
+
+    def _compute_repulsive_force(self):
+        """计算 270° 范围内障碍物的斥力场。
+
+        Returns:
+            repulse_angular: 斥力角速度修正（弧度），正=左推，负=右推
+            repulse_brake: 减速因子 [0, 1]
+        """
+        if self.latest_scan is None:
+            return 0.0, 1.0
+
+        scan = self.latest_scan
+        repulse_fov_rad = math.radians(self.repulse_fov_deg) / 2.0
+        repulse_dist = self.repulse_dist
+        gain = self.repulse_gain
+
+        fx_sum = 0.0
+        fy_sum = 0.0
+        min_front_dist = float('inf')
+
+        for i in range(len(scan.ranges)):
+            r = scan.ranges[i]
+            angle = scan.angle_min + i * scan.angle_increment
+            angle = math.atan2(math.sin(angle), math.cos(angle))
+
+            if abs(angle) > repulse_fov_rad:
+                continue
+            if r < scan.range_min or r > scan.range_max or math.isinf(r) or math.isnan(r):
+                continue
+
+            if abs(angle) < math.radians(30) and r < min_front_dist:
+                min_front_dist = r
+
+            if r >= repulse_dist:
+                continue
+
+            # 非线性斥力：距离越近力越大（二次方衰减）
+            # 在 repulse_dist 边缘力很小，越近越陡峭
+            normalized = (repulse_dist - r) / (repulse_dist - self.emergency_dist)
+            normalized = max(0.0, min(1.0, normalized))
+            force_mag = gain * normalized * normalized * (1.0 / max(r, 0.05))
+            repulse_angle = angle + math.pi
+            fx_sum += force_mag * math.cos(repulse_angle)
+            fy_sum += force_mag * math.sin(repulse_angle)
+
+        # 合力角度偏移（斥力方向）
+        repulse_angular = math.atan2(fy_sum, max(abs(fx_sum), 0.01))
+        force_magnitude = math.hypot(fx_sum, fy_sum)
+        # 放大系数：合力越大偏转越多，上限 1.5
+        repulse_angular *= min(force_magnitude * 0.3, 1.5)
+
+        # 前方减速因子
+        if min_front_dist < repulse_dist:
+            repulse_brake = 0.3 + 0.7 * max(0.0,
+                (min_front_dist - self.emergency_dist) /
+                (repulse_dist - self.emergency_dist))
         else:
-            if self.obstacle_detected:
-                self.obstacle_detected = False
-                self._obstacle_replan_triggered = False
-                self.get_logger().info(f"✅ 障碍物已清除（{min_dist:.2f}m），恢复跟踪")
+            repulse_brake = 1.0
 
-    def _get_min_depth(self, msg: Image):
-        """从深度图中央 ROI 提取最近有效深度（米）。"""
-        try:
-            if msg.encoding in ('16UC1', 'mono16'):
-                raw = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-                depth_m = raw.astype(np.float32) / 1000.0
-            elif msg.encoding == '32FC1':
-                depth_m = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            else:
-                return None
-        except Exception:
-            return None
-
-        h, w = depth_m.shape
-        row_top = int(h * self.obstacle_roi_top)
-        row_bottom = int(h * self.obstacle_roi_bottom)
-        half_w = int(w * min(math.tan(self.obstacle_fov_rad / 2.0), 0.5))
-        col_left = max(0, w // 2 - half_w)
-        col_right = min(w, w // 2 + half_w)
-
-        roi = depth_m[row_top:row_bottom, col_left:col_right]
-        valid = roi[(roi > self.min_valid_depth) & (roi < self.max_valid_depth)]
-        return float(np.min(valid)) if len(valid) > 0 else None
+        return repulse_angular, repulse_brake
 
     # ==================== 主控制循环 ====================
 
     def control_loop(self):
-        if self.desired_path is None or self.current_pose is None or self.current_yaw is None:
-            self.stop_robot()
+        if self.current_x is None or self.current_yaw is None:
             return
-        if self.path_completed or self.obstacle_detected:
-            self.stop_robot()
+        if not self.goal_active:
             return
 
-        now = time.monotonic()
-        dt = 0.1 if self.last_control_time is None else now - self.last_control_time
-        self.last_control_time = now
+        # 检查是否到达目标
+        dist_to_goal = math.hypot(
+            self.goal_x - self.current_x,
+            self.goal_y - self.current_y)
 
-        curr_x = self.current_pose.pose.position.x
-        curr_y = self.current_pose.pose.position.y
-
-        # 检查是否到达终点
-        final_pt = self.desired_path[-1].pose.position
-        dist_to_final = math.hypot(final_pt.x - curr_x, final_pt.y - curr_y)
-        if dist_to_final < self.arrival_threshold:
-            self.stop_robot()
-            self.path_completed = True
-            self.desired_path = None
-            self.get_logger().info(f"✅ 路径完成！距终点: {dist_to_final:.3f}m，触发 Gemini 请求下一段")
-            self._trigger_replan()
+        if dist_to_goal < self.arrival_threshold:
+            if not self._goal_reached_logged:
+                self._goal_reached_logged = True
+                self.goal_active = False
+                self.stop_robot()
+                self.get_logger().info(
+                    f"✅ 到达目标点！距离: {dist_to_goal:.3f}m，触发 Gemini 下一轮")
+                self._trigger_replan()
             return
 
-        # 推进目标点索引
-        while self.current_target_idx < len(self.desired_path) - 1:
-            pt = self.desired_path[self.current_target_idx].pose.position
-            if math.hypot(pt.x - curr_x, pt.y - curr_y) >= self.arrival_threshold * 2:
-                break
-            self.current_target_idx += 1
+        # 目标方向（吸引力）
+        goal_angle_local = self._get_goal_angle_local()
 
-        # Pure Pursuit: 找前瞻目标
-        target_idx = self.current_target_idx
-        for i in range(self.current_target_idx, len(self.desired_path)):
-            pt = self.desired_path[i].pose.position
-            if math.hypot(pt.x - curr_x, pt.y - curr_y) >= self.lookahead_dist:
-                target_idx = i
-                break
-        target_idx = min(target_idx, len(self.desired_path) - 1)
-        target = self.desired_path[target_idx].pose.position
+        # 紧急停车检测
+        if self._check_emergency():
+            now = time.monotonic()
+            if self._stuck_start_time is None:
+                self._stuck_start_time = now
+            stuck_duration = now - self._stuck_start_time
 
-        dx = target.x - curr_x
-        dy = target.y - curr_y
-        dist = math.hypot(dx, dy)
-        raw_angle_error = math.atan2(math.sin(math.atan2(dy, dx) - self.current_yaw),
-                                     math.cos(math.atan2(dy, dx) - self.current_yaw))
+            # 如果目标在侧面/后方（角度偏差 > 60°），允许纯角速度原地转向脱困
+            if abs(goal_angle_local) > math.radians(60):
+                # 纯转向：不前进，只原地旋转朝向目标方向
+                angular_cmd = goal_angle_local * 1.5
+                angular_cmd = max(-self.max_angular_vel,
+                                  min(angular_cmd, self.max_angular_vel))
+                cmd = Twist()
+                cmd.linear.x = 0.0
+                cmd.angular.z = angular_cmd
+                self.cmd_pub1.publish(cmd)
+                self.cmd_pub2.publish(cmd)
+                self.get_logger().info(
+                    f"🔄 紧急停车但目标在侧面({math.degrees(goal_angle_local):.0f}°)，原地转向中...",
+                    throttle_duration_sec=2.0)
+                self._stuck_start_time = None  # 正在转向，不算卡住
+                return
 
-        # 低通滤波：平滑角度误差，抑制高频抖动（alpha=0.3 → 70% 旧值 + 30% 新值）
-        alpha = 0.3
-        angle_error = alpha * raw_angle_error + (1.0 - alpha) * self._prev_angle_error
-        self._prev_angle_error = angle_error
+            # 前方有障碍但目标也在前方 → 停车等待重规划
+            self.stop_robot()
+            self.get_logger().warn(
+                f"🛑 紧急停车！前方极近障碍物"
+                f"（已持续 {stuck_duration:.1f}s）",
+                throttle_duration_sec=3.0)
+            if (stuck_duration > self._stuck_timeout and
+                    now - self._last_replan_time > self._replan_cooldown):
+                self._last_replan_time = now
+                self._stuck_start_time = None
+                self.goal_active = False
+                self.get_logger().warn(
+                    f"⚠️ 卡住超过 {self._stuck_timeout}s，触发 Gemini 重规划！")
+                self._trigger_replan()
+            return
+        else:
+            self._stuck_start_time = None
 
-        angular_cmd = self.angular_pid.compute(angle_error, dt)
+        # 斥力场修正
+        repulse_angular, repulse_brake = self._compute_repulsive_force()
 
-        # 余弦衰减：大角度误差时更激进地减速（比线性衰减更平滑）
-        angle_factor = max(0.0, math.cos(min(abs(angle_error), math.pi / 2.0)))
-        linear_cmd = self.linear_pid.compute(dist, dt) * angle_factor
-        if dist > 0.1 and linear_cmd < 0.03:
-            linear_cmd = 0.03
+        # 最终方向 = 目标方向 + 斥力修正
+        target_direction = goal_angle_local + repulse_angular
+        target_direction = math.atan2(
+            math.sin(target_direction), math.cos(target_direction))
 
+        # 角速度：P 控制
+        angular_cmd = target_direction * 2.0
+
+        # 线速度：方向偏差越大越慢
+        angle_factor = max(0.0, math.cos(target_direction))
+        linear_cmd = self.max_linear_vel * angle_factor
+
+        # 斥力场减速
+        linear_cmd *= repulse_brake
+
+        # 限幅
+        linear_cmd = max(0.0, min(linear_cmd, self.max_linear_vel))
+        angular_cmd = max(-self.max_angular_vel, min(angular_cmd, self.max_angular_vel))
+
+        # 保证最小速度
+        if abs(target_direction) < math.radians(60):
+            if dist_to_goal > self.arrival_threshold and linear_cmd < self.min_linear_vel:
+                linear_cmd = self.min_linear_vel
+
+        # 接近目标时减速
+        if dist_to_goal < 0.5:
+            linear_cmd *= (dist_to_goal / 0.5)
+            linear_cmd = max(linear_cmd, self.min_linear_vel * 0.5)
+
+        # 发布速度指令
         cmd = Twist()
         cmd.linear.x = linear_cmd
         cmd.angular.z = angular_cmd
@@ -289,7 +339,12 @@ class TrackPath(Node):
     def _replan_done(self, future):
         try:
             r = future.result()
-            self.get_logger().info(f"{'✅' if r.success else '⚠️'} 重规划: {r.message}")
+            self.get_logger().info(
+                f"{'✅' if r.success else '⚠️'} 重规划: {r.message}")
+            # 如果 Agent 返回的消息包含"任务已结束"，不再接受新目标
+            if r.message and "任务已结束" in r.message:
+                self.goal_active = False
+                self.get_logger().info("🏁 Agent 已结束任务，track_path 停止导航")
         except Exception as e:
             self.get_logger().error(f"重规划异常: {e}")
 
@@ -299,9 +354,14 @@ def main(args=None):
     node = TrackPath()
     try:
         rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == '__main__':

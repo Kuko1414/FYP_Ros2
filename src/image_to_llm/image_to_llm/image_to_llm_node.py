@@ -37,7 +37,7 @@ class ImageToLLMNode(Node):
         
         # 尝试加载 .env 配置文件（API_KEY、代理等敏感信息）
         if os.path.exists(env_path):
-            load_dotenv(env_path)
+            load_dotenv(env_path, override=True)
             self.get_logger().info(f"已加载配置文件: {env_path}")
         else:
             self.get_logger().warn(f"未找到配置文件: {env_path}, 将尝试使用系统的环境变量。请确保你创建了它避免泄露API KEY")

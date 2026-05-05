@@ -50,6 +50,10 @@ class ImageConversionNode(Node):
         self.declare_parameter('ground_plane_fallback', True)   # 深度无效时是否使用地面平面假设
         self.declare_parameter('camera_height', 0.15)           # 相机离地高度（米），用于地面平面 fallback
         self.declare_parameter('camera_pitch', 0.0)             # 相机俯仰角（弧度，正值=向下），用于地面平面 fallback
+        self.declare_parameter('ground_plane_max_depth', 2.0)   # ground_plane fallback 最大允许深度（米）
+        self.declare_parameter('direction_filter_enabled', True) # 是否启用路径点方向一致性过滤（防掉头）
+        self.declare_parameter('direction_anchor_count', 2)     # 前 N 个点作为锚点，不参与方向过滤
+        self.declare_parameter('direction_max_angle_deg', 90.0) # 方向偏差超过此角度的点被视为掉头并丢弃
         self.declare_parameter('log_dir', '/home/kuko/humble_ws/data/log')
         self.declare_parameter('task_id', -1)  # task 编号，-1 表示使用时间戳命名
 
@@ -65,6 +69,10 @@ class ImageConversionNode(Node):
         self.ground_plane_fallback = self.get_parameter('ground_plane_fallback').value
         self.camera_height = self.get_parameter('camera_height').value
         self.camera_pitch = self.get_parameter('camera_pitch').value
+        self.ground_plane_max_depth = self.get_parameter('ground_plane_max_depth').value
+        self.direction_filter_enabled = self.get_parameter('direction_filter_enabled').value
+        self.direction_anchor_count = self.get_parameter('direction_anchor_count').value
+        self.direction_max_angle_rad = math.radians(self.get_parameter('direction_max_angle_deg').value)
         self.log_dir = self.get_parameter('log_dir').value
         self.task_id = self.get_parameter('task_id').value
         self._conversion_count = 0  # 当前 task 内的第几次转换
@@ -281,11 +289,100 @@ class ImageConversionNode(Node):
         cam_x = (u - self.cx) * cam_z / self.fx
         cam_y = self.camera_height  # 地面高度
 
-        # 合理性检查
-        if cam_z < self.min_valid_depth or cam_z > self.max_valid_depth:
+        # 合理性检查：使用 ground_plane 专用的最大深度限制
+        if cam_z < self.min_valid_depth or cam_z > self.ground_plane_max_depth:
             return None
 
         return cam_x, cam_y, cam_z
+
+    # ================================================================
+    #  路径点方向一致性过滤（防掉头）
+    # ================================================================
+
+    def _filter_backward_points(self, poses, conversion_details):
+        """过滤掉方向反转（掉头）的路径点。
+        
+        原理：
+          1. 前 N 个点（anchor_count）作为锚点，无条件保留（近距离深度可靠）
+          2. 用前几个锚点确定整体前进方向角（reference_heading）
+          3. 后续每个点：计算它相对于上一个保留点的方向角，
+             如果与 reference_heading 偏差 > max_angle，则判定为掉头并丢弃
+        
+        Args:
+            poses: list of PoseStamped（已转换到 odom 的路径点）
+            conversion_details: 对应的 debug 详情列表（仅已成功转换的）
+            
+        Returns:
+            (filtered_poses, filtered_details, removed_count)
+        """
+        if not self.direction_filter_enabled or len(poses) <= self.direction_anchor_count:
+            return poses, conversion_details, 0
+
+        # 提取成功转换的 detail（有 odom 坐标的）
+        valid_details = [d for d in conversion_details if d.get('odom') is not None]
+        
+        # poses 和 valid_details 应该一一对应
+        if len(valid_details) != len(poses):
+            # 数量不匹配时放弃过滤，安全起见
+            return poses, conversion_details, 0
+
+        # 用前几个锚点确定整体前进方向
+        anchor_end = min(self.direction_anchor_count, len(poses))
+        if anchor_end < 2:
+            # 不足 2 个点无法判定方向
+            return poses, conversion_details, 0
+
+        # reference_heading: 从第一个锚点到最后一个锚点的方向
+        p0 = poses[0].pose.position
+        p_anchor = poses[anchor_end - 1].pose.position
+        dx_ref = p_anchor.x - p0.x
+        dy_ref = p_anchor.y - p0.y
+        if math.hypot(dx_ref, dy_ref) < 0.01:
+            # 锚点太密集，无法确定方向，放弃过滤
+            return poses, conversion_details, 0
+        reference_heading = math.atan2(dy_ref, dx_ref)
+
+        filtered_poses = list(poses[:anchor_end])
+        filtered_details = list(valid_details[:anchor_end])
+        removed_count = 0
+        last_kept = poses[anchor_end - 1]
+
+        for j in range(anchor_end, len(poses)):
+            curr = poses[j]
+            dx = curr.pose.position.x - last_kept.pose.position.x
+            dy = curr.pose.position.y - last_kept.pose.position.y
+            step_dist = math.hypot(dx, dy)
+
+            if step_dist < 0.01:
+                # 距离太近，保留（不影响方向判断）
+                filtered_poses.append(curr)
+                filtered_details.append(valid_details[j])
+                last_kept = curr
+                continue
+
+            step_heading = math.atan2(dy, dx)
+            # 计算与整体前进方向的偏差
+            angle_diff = abs(math.atan2(
+                math.sin(step_heading - reference_heading),
+                math.cos(step_heading - reference_heading)))
+
+            if angle_diff > self.direction_max_angle_rad:
+                # 方向反转，丢弃此点
+                removed_count += 1
+                # 标记 detail 为被方向过滤丢弃
+                valid_details[j]['method'] = 'DIR_FILTERED'
+                valid_details[j]['reason'] = (
+                    f'方向偏差 {math.degrees(angle_diff):.1f}° > '
+                    f'{math.degrees(self.direction_max_angle_rad):.0f}°')
+                self.get_logger().warn(
+                    f"🔄 路径点 {valid_details[j]['idx']} 方向偏差 "
+                    f"{math.degrees(angle_diff):.1f}°，判定为掉头，已丢弃")
+            else:
+                filtered_poses.append(curr)
+                filtered_details.append(valid_details[j])
+                last_kept = curr
+
+        return filtered_poses, filtered_details, removed_count
 
     # ================================================================
     #  主逻辑：像素消息处理
@@ -393,17 +490,29 @@ class ImageConversionNode(Node):
                 'odom': (odom_x, odom_y)
             })
 
+        # ---- 方向一致性过滤（防掉头）----
+        pre_filter_count = len(path_msg.poses)
+        if len(path_msg.poses) > 0:
+            filtered_poses, filtered_valid_details, dir_removed = \
+                self._filter_backward_points(list(path_msg.poses), conversion_details)
+            path_msg.poses = filtered_poses
+            # 将被方向过滤的 detail 也合并回 conversion_details（已在原地标记）
+        else:
+            dir_removed = 0
+
         if len(path_msg.poses) > 0:
             self.path_pub.publish(path_msg)
-            depth_methods = [d['method'] for d in conversion_details if d.get('depth') is not None]
+            depth_methods = [d['method'] for d in conversion_details
+                             if d.get('depth') is not None and d['method'] not in ('DIR_FILTERED',)]
             depth_count = depth_methods.count('depth')
             gp_count = depth_methods.count('ground_plane')
+            skip_count = len(points_data) - pre_filter_count
             self.get_logger().info(
                 f"✅ 已发布 {len(path_msg.poses)} 个路径点 [odom]。"
                 f"深度反投影: {depth_count}, 地面假设: {gp_count}, "
-                f"跳过: {len(points_data) - len(path_msg.poses)}")
+                f"跳过: {skip_count}, 方向过滤: {dir_removed}")
         else:
-            self.get_logger().warn("无法生成有效路径点（所有像素点深度均无效）。")
+            self.get_logger().warn("无法生成有效路径点（所有像素点深度均无效或方向不一致）。")
 
         # ---- 写入 debug 日志 ----
         self._write_debug_log(points_data, conversion_details, path_msg.poses)
@@ -454,7 +563,14 @@ class ImageConversionNode(Node):
             # 转换详情
             lines.append(f"--- 像素 → 3D → odom 转换详情 ---")
             for d in conversion_details:
-                if d.get('depth') is None:
+                if d['method'] == 'DIR_FILTERED':
+                    cam = d.get('cam_3d', (0, 0, 0))
+                    odom = d.get('odom', (0, 0))
+                    lines.append(
+                        f"  点{d['idx']}: raw={d['raw']} → decoded={d['decoded']} "
+                        f"→ depth={d['depth']:.3f}m → odom=({odom[0]:.4f},{odom[1]:.4f}) "
+                        f"→ DIR_FILTERED: {d.get('reason', '')}")
+                elif d.get('depth') is None:
                     lines.append(
                         f"  点{d['idx']}: raw={d['raw']} → decoded={d['decoded']} "
                         f"→ {d['method']}: {d.get('reason', '')}")

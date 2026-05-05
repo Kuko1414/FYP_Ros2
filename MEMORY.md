@@ -99,3 +99,7 @@ For AI coding agents. This is a record of each change made to the workspace cont
 - **解决 Jetson 宕机与轨迹边沿跳变**：调低 Orin 功耗与分辨率解决相机启动死机；优化 `default.yaml` 提示词禁止大模型跨越障碍物生成路点。
 - **引入 TF2 重构由于机械误差导致的坐标漂移偏移**：在 `robot_vlm_launch.py` 注入实测高度（Z=155mm）的静态 TF 树。重构 `image_conversion.py`，彻底废除手动 `odom` 订阅和三角函数算姿态，转用 `tf2_ros.TransformListener`。此修改通过依赖系统级 TF 树计算深度流像素的级联空间矩阵，完美解决了路点一直错位到“车轮下”的追踪异常。
 - **完善端到端纯视觉导航闭环（到达终点门）**：修复了 `image_conversion.py` 中 TF 缓冲区对未来时间戳的外推报错（强制 stamp=0）。在 `robot_vlm_launch.py` 中将 `obstacle_distance` 安全距离缩小至 0.2m 防止提前误刹车。去除了 `track_path.py` 中所有硬编码的绝对坐标与原地旋转逻辑。在 `default.yaml` 的提示词中，向大模型引入了相机极低安装高度带来的“透视原理”约束，强制大模型将局部路径点纵深规划到画面中上方（Y在500~550附近），成功将单次步进距离从0.3m提升至1.5m~2m。通过纯粹的“拍摄->生成平滑短曲线->循迹->再拍摄”闭环，实现了自然平滑的转向与长距离避障，最终成功引导小车到达走廊门前。
+
+## Apr.22, 2026
+- **修复 Agent 模式 RGB 图像无法获取（相机驱动阻塞）：** 根因：`robot_tools.py` 和 `track_path.py` 使用 `RELIABLE` QoS 订阅相机话题，多个 RELIABLE 订阅者导致 Orbbec Gemini 2L USB 相机驱动的 DDS 发送队列饱和，相机完全停止发布所有图像。解决：将两个文件的相机订阅 QoS 改为 `BEST_EFFORT`（RELIABLE publisher → BEST_EFFORT subscriber 兼容）。同时为 `get_front_image` 增加 3 轮×5 秒重试等待，`_rgb_cb` 不再静默吞异常。
+- **修复 Gemini 规划路径方向反转（坐标系公式错误）：** 根因：`agent_default.yaml` 中 yaw 定义写成"顺时针为正"，但实测 `/odom` 的 yaw 是标准 ROS2 的逆时针为正，导致前方/左方/右方坐标转换公式全部反向。解决：修正 yaw 定义为"逆时针为正（90°=正北, -90°=正南）"，更正三个方向转换公式，同步更新 `robot_tools.py` docstring。
