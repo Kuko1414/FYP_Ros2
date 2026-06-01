@@ -1,51 +1,54 @@
 # Ros2_Mocap_Motion
 
-基于 ROS2 + Gemini VLM 的轮式机器人视觉路径规划系统。机器人通过深度相机感知环境，利用 Gemini 多模态大模型进行避障路径规划，并使用 Pure Pursuit + PID 控制算法跟踪路径。
+[![CN](https://img.shields.io/badge/语言-中文-red.svg)](README_CN.md)
+[![EN](https://img.shields.io/badge/Language-English-blue.svg)](README.md)
+
+A ROS2 + Gemini VLM wheeled robot visual path planning system. The robot perceives the environment through a depth camera, uses the Gemini multimodal large model for obstacle-avoidance path planning, and tracks paths with Pure Pursuit + PID control.
 
 ---
 
-## 目录
+## Table of Contents
 
-- [系统架构](#系统架构)
-- [依赖安装](#依赖安装)
-- [编译工作区](#编译工作区)
-- [配置 Gemini API](#配置-gemini-api)
-- [启动流程](#启动流程)
-  - [模式 A：手动路径规划（Step 1-2）](#模式-a手动路径规划step-1-2)
-  - [模式 B：VLM 自动避障闭环（Step 3-6）](#模式-bvlm-自动避障闭环step-3-6)
-- [手动触发 LLM 规划](#手动触发-llm-规划)
-- [ROS2 节点说明](#ros2-节点说明)
-- [常用调试命令](#常用调试命令)
+- [System Architecture](#system-architecture)
+- [Dependencies](#dependencies)
+- [Build Workspace](#build-workspace)
+- [Configure Gemini API](#configure-gemini-api)
+- [Launch](#launch)
+  - [Mode A: Manual Path Planning (Step 1-2)](#mode-a-manual-path-planning-step-1-2)
+  - [Mode B: VLM Autonomous Obstacle Avoidance (Step 3-6)](#mode-b-vlm-autonomous-obstacle-avoidance-step-3-6)
+- [Manual LLM Trigger](#manual-llm-trigger)
+- [ROS2 Nodes](#ros2-nodes)
+- [Debug Commands](#debug-commands)
 
 ---
 
-## 系统架构
+## System Architecture
 
 ```
-深度相机 RGB ──→ image_to_llm_node ──→ Gemini API
-                                           │
-                                     /llm_pixels (归一化像素坐标 JSON)
-                                           │
-深度相机 Depth ──→ image_conversion ──→ 针孔模型反投影 + odom 变换
-                                           │
-                                        /path (nav_msgs/Path)
-                                           │
-                                      track_path ──→ /cmd_vel (速度指令)
-                                           │
-                              位置反馈 (Odom / Mocap / GPS)
+Depth Camera RGB ──→ image_to_llm_node ──→ Gemini API
+                                               │
+                                         /llm_pixels (normalized pixel coordinates JSON)
+                                               │
+Depth Camera Depth ──→ image_conversion ──→ Pinhole reprojection + odom transform
+                                               │
+                                            /path (nav_msgs/Path)
+                                               │
+                                          track_path ──→ /cmd_vel (velocity commands)
+                                               │
+                                  Position feedback (Odom / Mocap / GPS)
 ```
 
 ---
 
-## 依赖安装
+## Dependencies
 
-使用 `install_dependencies.sh` 一键安装所有依赖（ROS2 Humble、Python 包、rosdep 等）：
+Use `install_dependencies.sh` to install all dependencies in one command (ROS2 Humble, Python packages, rosdep, etc.):
 
 ```bash
 source install_dependencies.sh
 ```
 
-主要依赖：
+Key dependencies:
 - ROS2 Humble (Ubuntu 22.04)
 - Python3, numpy, Pillow, opencv-python
 - google-genai, python-dotenv, PyYAML
@@ -53,140 +56,140 @@ source install_dependencies.sh
 
 ---
 
-## 编译工作区
+## Build Workspace
 
 ```bash
-# 1. source ROS2 环境
+# 1. Source ROS2 environment
 source /opt/ros/humble/setup.bash
 
-# 2. 编译（首次编译或代码修改后）
+# 2. Build (first time or after code changes)
 cd ~/humble_ws
 colcon build --symlink-install
 
-# 3. source 工作区
+# 3. Source workspace
 source install/setup.bash
 ```
 
-> **提示**：每次打开新终端都需要执行 `source /opt/ros/humble/setup.bash` 和 `source ~/humble_ws/install/setup.bash`，或将它们添加到 `~/.bashrc`。
+> **Tip:** You need to run `source /opt/ros/humble/setup.bash` and `source ~/humble_ws/install/setup.bash` in every new terminal, or add them to `~/.bashrc`.
 
 ---
 
-## 配置 Gemini API
+## Configure Gemini API
 
-`image_to_llm_node` 从配置文件 `src/image_to_llm/llm_config.env` 读取 API 密钥。此文件已在 `.gitignore` 中，不会被提交。
+`image_to_llm_node` reads API keys from `src/image_to_llm/llm_config.env`. This file is in `.gitignore` and will not be committed.
 
-**创建配置文件**：
+**Create config file:**
 
 ```bash
 nano src/image_to_llm/llm_config.env
 ```
 
-**文件内容示例**：
+**Example content:**
 
 ```env
-GEMINI_API_KEY=你的API密钥
+GEMINI_API_KEY=your_api_key_here
 GEMINI_MODEL=gemini-2.5-flash
 
-# 系统代理（如需翻墙访问 Gemini API）
+# System proxy (if needed to access Gemini API)
 HTTP_PROXY=http://127.0.0.1:7890
 HTTPS_PROXY=http://127.0.0.1:7890
 ```
 
-> **注意**：Prompt 已迁移到 Skill YAML 文件管理（`src/image_to_llm/image_to_llm/skills/default.yaml`），不再在 env 中配置。如果不需要代理，可以留空或删除 `HTTP_PROXY` / `HTTPS_PROXY` 行。
+> **Note:** Prompts have been migrated to Skill YAML files (`src/image_to_llm/image_to_llm/skills/default.yaml`) and are no longer configured in env. If you don't need a proxy, you can omit the `HTTP_PROXY` / `HTTPS_PROXY` lines.
 
-### Skill 系统
+### Skill System
 
-系统提示词通过 Skill YAML 文件管理，支持热切换：
+System prompts are managed via Skill YAML files with hot-swap support:
 
 ```bash
-# 使用默认 Skill
+# Use default Skill
 ros2 launch image_to_llm llm_node_launch.py
 
-# 指定 Skill（对应 skills/ 目录下的 YAML 文件名）
+# Specify a Skill (corresponds to YAML filename in skills/)
 ros2 launch image_to_llm llm_node_launch.py skill_name:=default
 ```
 
-Skill 文件位于 `src/image_to_llm/image_to_llm/skills/`，新增 Skill 只需添加一个 YAML 文件，零代码改动。
+Skill files are located in `src/image_to_llm/image_to_llm/skills/`. Adding a new Skill only requires adding a YAML file — zero code changes.
 
 ---
 
-## 启动流程
+## Launch
 
-### 前提条件
+### Prerequisites
 
-确保以下条件满足：
-1. 工作区已编译且已 source
-2. 机器人硬件已启动（提供相机 topic、odom topic 等）
-3. 如使用 VLM 模式，`llm_config.env` 已正确配置
+Ensure the following are met:
+1. Workspace is built and sourced
+2. Robot hardware is running (providing camera topics, odom topic, etc.)
+3. If using VLM mode, `llm_config.env` is properly configured
 
-### 模式 A：手动路径规划（Step 1-2）
+### Mode A: Manual Path Planning (Step 1-2)
 
-此模式不需要相机和 Gemini，仅使用手动输入坐标生成路径并跟踪。
+This mode does not require a camera or Gemini — paths are generated from manually entered coordinates.
 
-**终端 1 — 启动路径生成节点**：
+**Terminal 1 — Launch path generation node:**
 ```bash
 ros2 run my_robot_planner generate_path
 ```
-启动后在终端中输入目标坐标和形状，例如：
+After launch, enter target coordinates and shape in the terminal, e.g.:
 ```
 1.0 3.0 semicircle
 ```
-支持的形状：`straight`、`semicircle`、`s_shape`、`polynomial`
+Supported shapes: `straight`, `semicircle`, `s_shape`, `polynomial`
 
-**终端 2 — 启动路径跟踪节点**：
+**Terminal 2 — Launch path tracking node:**
 ```bash
 ros2 run my_robot_planner track_path
 ```
 
-> `track_path` 会自动订阅 `/path` 并开始跟踪，同时以 10Hz 发布速度指令到 `/cmd_vel` 和 `/agent0/cmd_vel`。
+> `track_path` automatically subscribes to `/path` and begins tracking, publishing velocity commands to `/cmd_vel` and `/agent0/cmd_vel` at 10Hz.
 
 ---
 
-### 模式 B：VLM 自动避障闭环（Step 3-6）
+### Mode B: VLM Autonomous Obstacle Avoidance (Step 3-6)
 
-此模式为完整的端到端闭环：`track_path` 自动触发 Gemini → 获取像素路径 → 深度反投影转 3D → 跟踪路径 → 到达/遇障碍 → 再次触发。
+Full end-to-end closed loop: `track_path` automatically triggers Gemini → receives pixel paths → depth reprojection to 3D → tracks path → arrival/obstacle → triggers again.
 
-#### Launch 启动（推荐，两个终端）
+#### Launch (Recommended, two terminals)
 
-**终端 1 — Gemini API 节点**（LLM 交互日志独立显示）：
+**Terminal 1 — Gemini API node** (LLM interaction logs displayed independently):
 ```bash
 ros2 launch image_to_llm llm_node_launch.py
 ```
 
-**终端 2 — 坐标转换 + 路径跟踪**（下游处理链路）：
+**Terminal 2 — Coordinate conversion + path tracking** (downstream processing pipeline):
 ```bash
 ros2 launch my_robot_planner robot_vlm_launch.py
 ```
 
-> 两个终端的日志互不干扰，方便分别调试 LLM 通信和路径跟踪。节点内置就绪等待机制，无论哪个终端先启动都能正确协作。
+> Logs from the two terminals do not interfere with each other, making it easy to debug LLM communication and path tracking separately. Nodes have built-in readiness waiting — they cooperate correctly regardless of launch order.
 
-### 节点就绪逻辑
+### Node Readiness Logic
 
-各节点内置了智能等待机制，无论启动顺序如何都能正确协作：
+Each node has built-in intelligent waiting, ensuring correct collaboration regardless of launch order:
 
-| 节点 | 等待条件 | 就绪标志 |
-|------|---------|---------|
-| `image_to_llm_node` | 收到首帧 RGB 图像 | ✅ 日志提示服务已就绪 |
-| `image_conversion` | camera_info + 深度图 + odom 均已收到 | ✅ 日志提示准备接收像素数据；未就绪时缓存像素消息 |
-| `track_path` | 收到 `/path` 路径 + odom 位置 | ✅ 开始 PID 跟踪 |
+| Node | Wait Condition | Ready Signal |
+|------|---------------|-------------|
+| `image_to_llm_node` | First RGB frame received | ✅ Service ready log |
+| `image_conversion` | camera_info + depth image + odom all received | ✅ Log indicates ready; caches pixel messages until ready |
+| `track_path` | `/path` received + odom position | ✅ Begins PID tracking |
 
-### 自动触发时机
+### Automatic Trigger Conditions
 
-`track_path` 会在以下情况自动向 Gemini 请求新路径：
-1. **路径完成触发**：到达终点（距离 < 0.15m）后自动请求下一段
-2. **障碍物触发**：深度图检测到正前方 < 0.8m 有障碍物，持续 3 秒后触发 Gemini 重规划
+`track_path` automatically requests new paths from Gemini when:
+1. **Path completion trigger:** Arrival at endpoint (distance < 0.15m) triggers next segment request
+2. **Obstacle trigger:** Depth map detects obstacle < 0.8m ahead, sustained for 3 seconds → triggers Gemini replanning
 
 ---
 
-## 手动触发 LLM 规划
+## Manual LLM Trigger
 
-如果需要手动触发一次 Gemini 路径规划（例如调试时）：
+To manually trigger a Gemini path planning request (e.g., for debugging):
 
 ```bash
 ros2 service call /trigger_llm_plan std_srvs/srv/Trigger
 ```
 
-也可以手动发布测试像素点（跳过 Gemini API，直接测试 image_conversion + track_path）：
+You can also manually publish test pixel points (skipping the Gemini API to directly test image_conversion + track_path):
 
 ```bash
 ros2 topic pub --once /llm_pixels std_msgs/msg/String "{data: '[{\"point\": [500, 800]}, {\"point\": [500, 700]}, {\"point\": [500, 600]}, {\"point\": [480, 500]}, {\"point\": [460, 400]}]'}"
@@ -194,95 +197,96 @@ ros2 topic pub --once /llm_pixels std_msgs/msg/String "{data: '[{\"point\": [500
 
 ---
 
-## ROS2 节点说明
+## ROS2 Nodes
 
-| 节点名 | 包名 | 启动命令 | 功能 |
-|--------|------|---------|------|
-| `generate_path` | `my_robot_planner` | `ros2 run my_robot_planner generate_path` | 根据坐标和形状生成路径，发布到 `/path`（手动模式） |
-| `track_path` | `my_robot_planner` | `ros2 run my_robot_planner track_path` | Pure Pursuit + PID 路径跟踪 + 深度图障碍物检测 |
-| `image_to_llm_node` | `image_to_llm` | `ros2 run image_to_llm image_to_llm_node` | 将 RGB 图像发送给 Gemini，获取像素路径点 |
-| `image_conversion` | `image_to_llm` | `ros2 run image_to_llm image_conversion` | 像素坐标 → 3D odom 坐标（深度反投影），发布 `/path` |
+| Node | Package | Launch Command | Function |
+|------|---------|---------------|----------|
+| `generate_path` | `my_robot_planner` | `ros2 run my_robot_planner generate_path` | Generate path from coordinates and shape, publish to `/path` (manual mode) |
+| `track_path` | `my_robot_planner` | `ros2 run my_robot_planner track_path` | Pure Pursuit + PID path tracking + depth-based obstacle detection |
+| `image_to_llm_node` | `image_to_llm` | `ros2 run image_to_llm image_to_llm_node` | Send RGB images to Gemini, receive pixel path points |
+| `image_conversion` | `image_to_llm` | `ros2 run image_to_llm image_conversion` | Pixel coordinates → 3D odom coordinates (depth reprojection), publish `/path` |
 
 ---
 
-## 常用调试命令
+## Debug Commands
 
 ```bash
-# 查看所有活跃的 topic
+# List all active topics
 ros2 topic list
 
-# 监听路径点
+# Echo path points
 ros2 topic echo /path
 
-# 监听 LLM 返回的像素坐标
+# Echo LLM pixel coordinates
 ros2 topic echo /llm_pixels
 
-# 监听速度指令
+# Echo velocity commands
 ros2 topic echo /cmd_vel
 
-# 查看节点列表
+# List nodes
 ros2 node list
 
-# 查看服务列表（确认 /trigger_llm_plan 是否可用）
+# List services (confirm /trigger_llm_plan is available)
 ros2 service list
 
-# 手动触发 LLM 规划
+# Manually trigger LLM planning
 ros2 service call /trigger_llm_plan std_srvs/srv/Trigger
 ```
 
 ---
 
-## 关键 ROS2 Topic
+## Key ROS2 Topics
 
-| Topic | 类型 | 说明 |
-|-------|------|------|
-| `/camera/color/image_raw` | `sensor_msgs/Image` | 深度相机 RGB 图像 |
-| `/camera/depth/image_raw` | `sensor_msgs/Image` | 深度图 |
-| `/camera/depth/camera_info` | `sensor_msgs/CameraInfo` | 深度相机内参 |
-| `/camera/color/camera_info` | `sensor_msgs/CameraInfo` | RGB 相机内参 |
-| `/llm_pixels` | `std_msgs/String` | Gemini 返回的归一化像素坐标 JSON |
-| `/path` | `nav_msgs/Path` | 3D 路径点（odom 坐标系） |
-| `/cmd_vel` | `geometry_msgs/Twist` | 速度指令 |
-| `/agent0/cmd_vel` | `geometry_msgs/Twist` | Webots 机器人速度指令 |
-| `/odom` | `nav_msgs/Odometry` | 里程计位置+朝向 |
-| `/vrpn_mocap/rm_0_Test/pose` | `geometry_msgs/PoseStamped` | Mocap 位置（可选） |
+| Topic | Type | Description |
+|-------|------|-------------|
+| `/camera/color/image_raw` | `sensor_msgs/Image` | Depth camera RGB image |
+| `/camera/depth/image_raw` | `sensor_msgs/Image` | Depth image |
+| `/camera/depth/camera_info` | `sensor_msgs/CameraInfo` | Depth camera intrinsics |
+| `/camera/color/camera_info` | `sensor_msgs/CameraInfo` | RGB camera intrinsics |
+| `/llm_pixels` | `std_msgs/String` | Normalized pixel coordinates JSON from Gemini |
+| `/path` | `nav_msgs/Path` | 3D path points (odom frame) |
+| `/cmd_vel` | `geometry_msgs/Twist` | Velocity commands |
+| `/agent0/cmd_vel` | `geometry_msgs/Twist` | Webots robot velocity commands |
+| `/odom` | `nav_msgs/Odometry` | Odometry position + orientation |
+| `/vrpn_mocap/rm_0_Test/pose` | `geometry_msgs/PoseStamped` | Mocap position (optional) |
 
-> **注意**：相机话题名称取决于使用的深度相机型号。上表为当前 Intel D435 的话题名，更换为奥比中光 Gemini 336 后可能需要更新。话题参数在 launch 文件中配置，修改 launch 文件即可适配不同相机。
+> **Note:** Camera topic names depend on the depth camera model. The table above shows the current Intel D435 topic names — they may change when switching to an Orbbec Gemini 336. Topic parameters are configured in launch files; modify the launch file to adapt to different cameras.
 
 ---
 
-## 目录结构
+## Directory Structure
 
 ```
 humble_ws/
-├── ARCHITECTURE.md          # 系统架构设计文档
-├── PROCESS.md               # 开发步骤与进度
-├── MEMORY.md                # 变更记录
-├── README.md                # 本文件
-├── install_dependencies.sh  # 一键依赖安装脚本
+├── ARCHITECTURE.md          # System architecture design doc
+├── PROCESS.md               # Development steps & progress
+├── MEMORY.md                # Change log
+├── README.md                # This file (English)
+├── README_CN.md             # Chinese version
+├── install_dependencies.sh  # One-click dependency install script
 ├── data/
-│   ├── image/               # 运行时捕获的图像
-│   └── log/                 # 坐标转换 debug 日志
-├── future/                  # 未来架构设计文档
+│   ├── image/               # Runtime captured images
+│   └── log/                 # Coordinate conversion debug logs
+├── future/                  # Future architecture design docs
 │   ├── function_calling_design.md
 │   ├── skill_progressive_cognition.md
 │   └── agentic_workflow_vision.md
 └── src/
-    ├── my_robot_msgs/       # 自定义服务消息 (GeneratePath.srv)
-    ├── my_robot_planner/    # 路径生成 + 路径跟踪
+    ├── my_robot_msgs/       # Custom service messages (GeneratePath.srv)
+    ├── my_robot_planner/    # Path generation + path tracking
     │   ├── launch/
-    │   │   └── robot_vlm_launch.py  # 启动 conversion + track_path
+    │   │   └── robot_vlm_launch.py  # Launch conversion + track_path
     │   └── my_robot_planner/
     │       ├── generate_path.py
     │       └── track_path.py
-    └── image_to_llm/        # Gemini API 交互 + 像素→3D 转换
+    └── image_to_llm/        # Gemini API interaction + pixel→3D conversion
         ├── launch/
-        │   └── llm_node_launch.py   # 启动 image_to_llm_node
-        ├── llm_config.env   # API 配置（不在 git 中）
+        │   └── llm_node_launch.py   # Launch image_to_llm_node
+        ├── llm_config.env   # API config (not in git)
         └── image_to_llm/
             ├── image_to_llm_node.py
             ├── image_conversion.py
-            └── skills/      # Skill YAML 热插拔框架
-                ├── __init__.py   # Skill 加载器
-                └── default.yaml  # 默认路径规划 Skill
+            └── skills/      # Skill YAML hot-swap framework
+                ├── __init__.py   # Skill loader
+                └── default.yaml  # Default path planning Skill
 ```
