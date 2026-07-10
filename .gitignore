@@ -1,26 +1,24 @@
-# ROS 2 Workspace Directories
-build/
-install/
-log/
-src_learn
-Past_code/
+# Ignore the LLM Config file to prevent uploading API keys
+.github
+.clinerules
 quick_start_lattice.sh
-test_lattice_planner.sh
-
-# Python caches
-__pycache__/
-*.py[cod]
-*$py.class
-
-# IDE configurations
+test_sendImage.py
+result.jpg
 .vscode/
-compile_commands.json
-
-# OS generated files
-.DS_Store
-.DS_Store?
-._*
-.Spotlight-V100
-.Trashes
-ehthumbs.db
-Thumbs.db
+build
+install
+log
+Past_code
+src_learn
+test_lattice_planner.sh
+src/image_to_llm/llm_config.env
+Report
+frames_2026-04-01_18.03.13.gv
+frames_2026-04-01_18.03.13.pdf
+src/image_to_llm/llm_config.env
+data
+future
+image
+final project report(草稿)-2025.docx
+read_docx.py
+rules.md

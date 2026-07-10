@@ -15,22 +15,40 @@ The topic for sending the speed to the robot:
     - 'Twist, /agent0/cmd_vel' (include: linear x,y,z and angular x,y,z)
     - 'Twist, /cmd_vel' (include: linear x,y,z and angular x,y,z)
     
+The topic for obtaining the robot's orientation (yaw):
+    - 'Vector3Stamped, /imu/rpy/filtered' (include: header with frame_id 'imu_link', vector.x=Roll, vector.y=Pitch, vector.z=Yaw, all in radians. This is the filtered RPY output, vector.z can be used directly as the robot's heading angle)
+
 The topic for sending the path points to the robot:
     - 'Path, /path' (include: header and poses)
 
-The topic for depth camera and vision (Added for Step 3 & Step 4):
-    - 'Image, /camera/depth/image_raw' (depth_image topic)
-    - 'CameraInfo, /camera/depth/camera_info' (camera_info for pixel to physical conversion)
+The topic for depth camera and vision (Updated Apr.14 for Orbbec Gemini 2L):
+    - 'Image, /camera/color/image_raw' (RGB image from depth camera)
+    - 'CameraInfo, /camera/depth/camera_info' (depth camera_info for pixel to physical conversion)
+    - 'Image, /camera/depth/image_raw' (the depth image data for obstacle detection and path planning)
+    - 'CameraInfo, /camera/color/camera_info' (RGB camera intrinsic parameters)
+
+The topic for odometry and coordinate transforms (needed for Step 6 TF2):
+    - 'Odometry, /odom' (include: pose with position+orientation, twist with linear+angular velocity. Core data source for odom frame, can also serve as position feedback for Track_Path)
+    - 'TFMessage, /tf' (dynamic coordinate transform tree, essential for Step 6 depth_camera_link → odom/map transform)
+    - 'TFMessage, /tf_static' (static coordinate transforms, e.g. camera mount position relative to base_link)
+
+The topic for getting pose of the robot from imu:
+    - 'Imu, /agent0/imu' (its imu for webots robot, include: orientation, angular velocity, linear acceleration)
+    - 'Imu, /imu' (real robot raw IMU data)
+
+The topic for LiDAR (2D laser scanner):
+    - 'LaserScan, /scan_raw' (2D laser scan from LiDAR. frame_id: lidar_frame. 360° coverage, 504 rays, 0.716° resolution, range: 0.06m~25m. Used by track_path for obstacle detection in the forward FOV)
 
 ## 3. ROS2 Nodes
 
-- 'Generate_Path': This node is responsible for generating path points based on the starting point, ending point, and the desired path shape. It will publish the generated path points to the '/path' topic. (Optimization: To prevent blocking the ROS2 executor, user inputs for coordinates and shapes should be handled via a non-blocking separate thread, or ideally designed as a ROS2 Service/Action).
+- 'Generate_Path': （Not use）This node is responsible for generating path points based on the starting point, ending point, and the desired path shape. It will publish the generated path points to the '/path' topic. (Optimization: To prevent blocking the ROS2 executor, user inputs for coordinates and shapes should be handled via a non-blocking separate thread, or ideally designed as a ROS2 Service/Action).
 
-- 'Track_Path': This node receives the path points from the '/path' topic. It stores it as the desired path, calculates the deviation from the ideal path points continuously, and applies a feedback control algorithm (e.g., Pure Pursuit or continuous PID) to publish speed commands. If deviation is dangerously large (>0.5m), it stops the vehicle and requests a replan.
+- 'Track_Path': This node receives the path points from the '/path' topic. It stores it as the desired path, calculates the deviation from the ideal path points continuously, and applies a feedback control algorithm (e.g., Pure Pursuit or continuous PID) to publish speed commands. If deviation is dangerously large (>0.5m), it stops the vehicle and requests a replan. 
+    * [Architecture Decision: Yaw & Orientation Control] Do NOT implement manual "in-place rotation" or "global coordinate alignment" here. The robot must achieve naturally smooth heading adjustments inherently by tracking the curving path segments proposed end-to-end by the VLM (Gemini). The VLM prompt instructs it to draw curves guiding the robot toward a high-level goal, which the pure pursuit algorithm converts into smooth linear/angular velocities.
 
 - 'Image_Conversion': This node converts pixel-coordinates from the LLM (Gemini) into actual path points in meters. (Optimization: It MUST subscribe to the pixel coordinates AND the depth camera topics ('depth_image' and 'camera_info') to perform accurate 2D to 3D inverse projection mapping), then it publishes the converted path points to the '/path' topic.
 
-- 'rgb_image': This node is responsible for capturing RGB images from the depth camera. (blind for now)
+- 'image_to_llm': This node is send and response for the Gemini API. It sends the RGB image captured from the front camera to Gemini and receives the path points in normalized coordinates. It then publishes these pixel coordinates to a topic ('/llm_pixels') for the 'Image_Conversion' node to process.
 
 - 'depth_image': This node is responsible for capturing depth images from the depth camera. (blind for now)
 

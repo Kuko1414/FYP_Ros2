@@ -70,6 +70,8 @@ install_ros2_packages() {
         ros-humble-nav-msgs \
         ros-humble-std-msgs \
         ros-humble-sensor-msgs \
+        ros-humble-std-srvs \
+        ros-humble-cv-bridge \
         ros-humble-vrpn-mocap \
         ros-humble-ament-cmake \
         ros-humble-rosidl-default-generators \
@@ -102,43 +104,25 @@ install_workspace_deps() {
     info "工作区依赖安装完成。"
 }
 
-# ======================== 6. 安装其他额外依赖 (pip / apt) ========================
+# ======================== 6. 安装 Python 额外依赖 ========================
 install_extra_deps() {
-    info "安装其他额外依赖..."
+    info "安装 Python 额外依赖..."
 
-    # -------- apt 包 (每行一个，按需添加) --------
-    APT_PACKAGES=(
-        # 示例: sudo apt install -y <package_name>
-        # 在下方添加你需要的 apt 包，例如:
-        # "python3-opencv"
-        # "ffmpeg"
-
-    )
-
-    if [ ${#APT_PACKAGES[@]} -gt 0 ]; then
-        info "安装 apt 额外包: ${APT_PACKAGES[*]}"
-        sudo apt install -y "${APT_PACKAGES[@]}"
-    else
-        info "没有额外的 apt 包需要安装。"
-    fi
-
-    # -------- pip 包 (每行一个，按需添加) --------
     PIP_PACKAGES=(
-        # 每行只写包名（可带版本号），不需要写 pip3 install 命令
-        # 例如: "numpy" 或 "numpy>=1.21"
         "google-genai"
+        "python-dotenv"
         "numpy"
         "Pillow"
+        "opencv-python"
+        "PyYAML"
     )
 
     if [ ${#PIP_PACKAGES[@]} -gt 0 ]; then
-        info "安装 pip 额外包: ${PIP_PACKAGES[*]}"
+        info "安装 pip 包: ${PIP_PACKAGES[*]}"
         pip3 install -U "${PIP_PACKAGES[@]}"
-    else
-        info "没有额外的 pip 包需要安装。"
     fi
 
-    info "额外依赖安装完成。"
+    info "Python 额外依赖安装完成。"
 }
 
 # ======================== 7. 配置 shell 环境 ========================

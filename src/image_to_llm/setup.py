@@ -2,7 +2,7 @@ import os
 from glob import glob
 from setuptools import find_packages, setup
 
-package_name = 'my_robot_planner'
+package_name = 'image_to_llm'
 
 setup(
     name=package_name,
@@ -14,7 +14,13 @@ setup(
         ('share/' + package_name, ['package.xml']),
         (os.path.join('share', package_name, 'launch'),
             glob(os.path.join('launch', '*launch.[pxy][yma]*'))),
+        # Skill YAML 文件安装到 share 目录
+        (os.path.join('share', package_name, 'skills'),
+            glob(os.path.join('image_to_llm', 'skills', '*.yaml'))),
     ],
+    package_data={
+        'image_to_llm': ['skills/*.yaml'],
+    },
     install_requires=['setuptools'],
     zip_safe=True,
     maintainer='kuko',
@@ -28,8 +34,9 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'generate_path = my_robot_planner.generate_path:main',
-            'track_path = my_robot_planner.track_path:main',
+            'image_to_llm_node = image_to_llm.image_to_llm_node:main',
+            'image_conversion = image_to_llm.image_conversion:main',
+            'agent_node = image_to_llm.agent_node:main',
         ],
     },
 )
